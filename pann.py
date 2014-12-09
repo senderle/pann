@@ -1,7 +1,7 @@
 #!/usr/bin/python
 
-# ann.py -- An implementation of a feedforward neural network in python.
-#           Currently most useful for text modeling. 
+# pann.py -- An implementation of a feedforward neural network in python.
+#            Currently most useful for text modeling. 
 #
 #    Copyright 2014   by Jonathan Scott Enderle
 #
@@ -58,7 +58,9 @@ class NetworkTrainer(object):
         ashapes, zshapes = self.network.azshapes(n_samples)
         self._avals = [numpy.ones(s) for s in ashapes]
         self._zvals = [numpy.ones(s) for s in zshapes]
+        self._dvals = [numpy.ones(s) for s in zshapes]
 
+        # first layer of activation layers -- X with additional bias unit
         self._avals[0][:,1:] = X
         self._Y = Y
 
@@ -138,7 +140,44 @@ class NetworkTrainer(object):
             return True
         else:
             print "First theta vals matched, but not _is_last_theta!"
+            print "This should be an extremely rare event. It can"
+            print "safely be ignored. However, feel free to contact"
+            print "scott.enderle@gmail.com if it happens to you. He"
+            print "wants to know how often it happens in practice." 
             return False
+
+
+#    def gradient(self, theta):
+#        if not self._is_last_theta(theta):
+#            self.network.theta = theta
+#            self._forward_propagation()
+#        avals = self._avals
+#        zvals = self._zvals
+#
+#        thetas = self.network.theta_list
+#        n_samples = self.n_samples
+#
+#        d = avals[-1] - self.Y
+#        dvals = [d]
+#
+#        for t, z in reversed(zip(thetas[1:], zvals)):
+#            d = numpy.dot(d, t)[:,1:]
+#            d *= self._sigmoid_grad(z)
+#            dvals.append(d)
+#
+#        dvals.reverse()
+#
+#        theta_grads = [numpy.dot(d.T, a) / n_samples
+#                       for d, a in zip(dvals, avals)]
+#
+#        for g, t in zip(theta_grads, thetas):
+#            t_tail = self.reg_lambda / n_samples * t
+#            t_tail[:,0] = 0
+#            g += t_tail
+#
+#        return self.network.unroll(theta_grads)
+
+
 
     def gradient(self, theta):
         if not self._is_last_theta(theta):
@@ -146,20 +185,20 @@ class NetworkTrainer(object):
             self._forward_propagation()
         avals = self._avals
         zvals = self._zvals
+        dvals = self._dvals
         
         thetas = self.network.theta_list
         n_samples = self.n_samples
 
-        d = avals[-1] - self.Y
-        dvals = [d]
+        dvals[-1][:] = avals[-1]
+        dvals[-1] -= self.Y
 
-        for t, z in reversed(zip(thetas[1:], zvals)):
-            d = numpy.dot(d, t)[:,1:]
-            d *= self._sigmoid_grad(z)
-            dvals.append(d)
+        # propagate error terms in reverse
+        t_z_dprev_dnext = zip(thetas[1:], zvals, dvals, dvals[1:])
+        for t, z, dprev, dnext in reversed(t_z_dprev_dnext):
+            numpy.dot(dnext, t[:,1:], out=dprev)
+            dprev *= self._sigmoid_grad(z)
 
-        dvals.reverse()
-        
         theta_grads = [numpy.dot(d.T, a) / n_samples
                        for d, a in zip(dvals, avals)]
 
@@ -239,7 +278,7 @@ class Network(object):
 
     @property
     def theta_list(self):
-        return self.roll(self._theta)
+        return self.rollup(self._theta)
 
     @theta_list.setter
     def theta_list(self, theta):
@@ -254,9 +293,13 @@ class Network(object):
         self._theta = theta
 
     def azshapes(self, n_samples):
+        '''Given a number of samples for training, determine the shape
+        of the activation and z matrices. This is useful for preallocating
+        and reusing memory for these matrices, which can be quite large.'''
         shape = self.shape
 
         ashapes = [(n_samples, shape[0])]
+        # inner layers have additional bias units
         ashapes.extend((n_samples, s + 1) for s in shape[1:-1])
         ashapes.append((n_samples, shape[-1]))
         
@@ -264,13 +307,20 @@ class Network(object):
         
         return ashapes, zshapes
 
-    def roll(self, theta):
+    def rollup(self, theta):
+        '''Create a list of theta matrices containing the weights between
+        each of the network layers. This returns views into the data from
+        `theta`; it does not create copies.'''
         thetas = []
         for (rows, cols), (start, end) in zip(self._theta_shapes, self._theta_ranges):
             thetas.append(theta[start:end].reshape(rows, cols))
         return thetas
 
     def unroll(self, thetas):
+        '''Allocate a new array and fill it with data from each of the 
+        weight matrices in the list `thetas`. Unlike `rollup`, this does 
+        create a copy of the data.'''  # TODO: add an `out` parameter
+
         theta = numpy.empty(self._theta_size)
         for t, (start, end) in zip(thetas, self._theta_ranges):
             theta[start:end] = t.ravel()
@@ -347,6 +397,9 @@ class TrainingData(object):
         return instance
 
     def load_npy_dir(self, training_dir):
+        # Have this shuffle the data across all files. It will 
+        # require some refactoring.
+        
         in_dir = os.path.join(training_dir, 'input')
         out_dir = os.path.join(training_dir, 'output')
         in_files  = [os.path.join(in_dir, f)  for f in os.listdir(in_dir)  
