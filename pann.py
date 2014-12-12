@@ -32,6 +32,7 @@ import os.path
 import itertools
 import random
 from textwrap import TextWrapper
+from contextlib import closing
 
 class NetworkTrainer(object):
     '''A class for training feedforward networks of arbitrary sizes.
@@ -39,27 +40,50 @@ class NetworkTrainer(object):
     versions of this program will include support for auto-encoders and
     other pre-trainers appropriate for deep learning problems.'''
 
-    def __init__(self, network, X, Y):
+    def __init__(self, network, X=None, Y=None):
+ 
+        self.network = network
+        self.reg_lambda = 1
+        self.progress_msg = ProgressMessage()
         
-        if not X.shape[1] + 1 == network.shape[0] or not Y.shape[1] == network.shape[-1]:
+        self._n_samples = 0
+        self._avals = []
+        self._zvals = []
+        self._dvals = []
+
+        if X is not None and Y is not None:
+            self.update_XY(X, Y)
+        elif X is not None or Y is not None:
+            raise ValueError("NetworkTrainer(): Both X and Y must be supplied, or neither.")
+       
+    def update_XY(self, X, Y):
+        self._last_theta = None     # This is a crucial step for correctness for reasons that aren't obvious based
+                                    # on the name or the code. I don't like that. The issue is that if this value
+                                    # isn't reset to None at this point, then it's possible for backprop to run
+                                    # on the values from foward propagation from the _previous_ set of XY values.
+                                    # Unfortunately, I can't think of a better way to manage this. 
+
+        if (not X.shape[1] + 1 == self.network.shape[0] or 
+            not Y.shape[1] == self.network.shape[-1]):
             raise ValueError("Network shape and training data are not aligned.")
         if not X.shape[0] == Y.shape[0]:
             raise ValueError("Number of inputs does not match number of outputs in training data.")
+ 
+        n_samples = float(X.shape[0])
+        if self._n_samples == n_samples:
+            for a in self._avals:
+                a[:] = 1
+            for z in self._zvals:
+                z[:] = 1
+            for d in self._dvals:
+                d[:] = 1
+        else:
+            self._n_samples = n_samples
+            ashapes, zshapes = self.network.azshapes(n_samples)
+            self._avals = [numpy.ones(s) for s in ashapes]
+            self._zvals = [numpy.ones(s) for s in zshapes]
+            self._dvals = [numpy.ones(s) for s in zshapes]
         
-        self.network = network
-        self.reg_lambda = 1
-        self.update_XY(X, Y)
-        self._last_theta = None
-        self.progress_msg = ProgressMessage()
-
-    def update_XY(self, X, Y):
-        self._n_samples = n_samples = float(X.shape[0])
-        
-        ashapes, zshapes = self.network.azshapes(n_samples)
-        self._avals = [numpy.ones(s) for s in ashapes]
-        self._zvals = [numpy.ones(s) for s in zshapes]
-        self._dvals = [numpy.ones(s) for s in zshapes]
-
         # first layer of activation layers -- X with additional bias unit
         self._avals[0][:,1:] = X
         self._Y = Y
@@ -71,6 +95,10 @@ class NetworkTrainer(object):
     @property
     def Y(self):
         return self._Y
+
+    @property
+    def h(self):
+        return self._avals[-1]
 
     @property
     def n_samples(self):
@@ -99,7 +127,7 @@ class NetworkTrainer(object):
         out_layer = mid_layers.pop()
 
         for a, z, t in mid_layers:
-            z[:] = numpy.dot(a_in, t.T)
+            numpy.dot(a_in, t.T, out=z)
             a[:,1:] = self._sigmoid(z)
             a_in = a
         
@@ -177,12 +205,27 @@ class NetworkTrainer(object):
 #
 #        return self.network.unroll(theta_grads)
 
+    def check_gradient_sample(self, theta, n_samples, eps=10 ** -4):
+        grad = self.gradient(theta)
+        theta_eps = theta[:]
 
+        samples = numpy.random.randint(0, theta.size, n_samples)
+        grad_err = []
+        for s in samples:
+            theta_eps[s] += eps
+            grad_s = self.cost(theta_eps)
+            theta_eps[s] -= 2 * eps
+            grad_s -= self.cost(theta_eps)
+            grad_s /= 2 * eps
+            grad_err.append((grad[s], grad_s, numpy.fabs(grad_s - grad[s])))
+
+        return grad_err
 
     def gradient(self, theta):
         if not self._is_last_theta(theta):
             self.network.theta = theta
             self._forward_propagation()
+        
         avals = self._avals
         zvals = self._zvals
         dvals = self._dvals
@@ -212,14 +255,13 @@ class NetworkTrainer(object):
     def train(self, lamb, iters):
         self.reg_lambda = float(lamb)
         callback = self.progress_msg.update
-        callback
-
         theta = scipy.optimize.fmin_cg(self.cost, 
                                        self.network.theta, 
                                        self.gradient, 
                                        maxiter=iters,
                                        disp=False,
                                        callback=callback)
+        self.progress_msg.reset()
         self.network.theta = theta
 
     def accuracy(self):
@@ -328,7 +370,7 @@ class Network(object):
 
 class ProgressMessage(object):
     def __init__(self, count=0):
-        self.message = ('Training... Iteration {}: ' 
+        self.message = ('Iteration {}: ' 
                         'Cost: {:6.4f} | Time Elapsed: {:.2f}s '
                         '(total), {:.2f}s (since last iteration) ')
         self.count = count
@@ -336,20 +378,21 @@ class ProgressMessage(object):
         self.last_time = time.clock()
         self.total_time = 0
 
+    def reset(self, count=0):
+        self.count = count
+        self.cost = 0
+        self.last_time = time.clock()
+        self.total_time = 0
+
     def update(self, *args, **kwargs):
         self.count += 1
-        if self.count > 1:
-            now = time.clock()
-            elapsed = now - self.last_time
-            self.total_time += elapsed
-            self.last_time = now
-            message = '\r' + self.message.format(self.count, self.cost, self.total_time, elapsed)
-            sys.stdout.write(message)
-            sys.stdout.flush()
-        else:
-            self.last_time = time.clock()
-            sys.stdout.write('Training... Iteration 1...')
-            sys.stdout.flush()
+        now = time.clock()
+        elapsed = now - self.last_time
+        self.total_time += elapsed
+        self.last_time = now
+        message = '\r' + self.message.format(self.count, self.cost, self.total_time, elapsed)
+        sys.stdout.write(message)
+        sys.stdout.flush()
 
 def markov_visualizer(network, start, key, sample=False, n_cycles=100):
     n_features = network.theta_list[0].shape[1] - 1
@@ -372,6 +415,7 @@ class TrainingData(object):
     def __init__(self):  # eventually make some educated guesses about which classmethod constructor to call
                          # by checking if the input is a directory, h5 file, or pair of npy files
         self.generator = lambda: iter(())
+        self.data_filename = None
         self.in_size = None
         self.out_size = None
 
@@ -395,7 +439,7 @@ class TrainingData(object):
         instance = cls()
         instance.load_h5_table(h5_file)
         return instance
-
+    
     def load_npy_dir(self, training_dir):
         # Have this shuffle the data across all files. It will 
         # require some refactoring.
@@ -426,8 +470,8 @@ class TrainingData(object):
         self.generator = self._npy_gen([in_file], [out_file])
 
     def _npy_gen(self, in_seq, out_seq):
-        data_zip = itertools.izip(in_seq, out_seq)
         def data_iter():
+            data_zip = itertools.izip(in_seq, out_seq)
             for in_f, out_f in data_zip:
                 in_arr = numpy.load(in_f).astype(float)
                 out_arr = numpy.load(out_f).astype(float)
@@ -483,45 +527,44 @@ class TrainingData(object):
 
         return a
 
-    def load_h5_table(self, h5_file, chunksize=40000):
-        f = tables.open_file(h5_file, 'r')
-
-        in_rows = f.root.input.shape[0]
+    def _h5_gen(self, h5_file, chunksize):
+        with closing(tables.open_file(h5_file, 'r')) as f:
+            in_rows = f.root.input.shape[0]
+            
         n_chunks = in_rows / chunksize
         if n_chunks * chunksize < in_rows:
             n_chunks += 1
 
-        mask = numpy.arange(in_rows) % n_chunks
-        numpy.random.shuffle(mask)
-
-        self.in_size = f.root.input.shape[1]
-        self.out_size = f.root.output.shape[1]
-
-        f.close()
-
         def data_iter():
-            f = tables.open_file(h5_file, 'r')
-            h5_in = f.root.input
-            h5_out = f.root.output
-
-            for i in range(n_chunks):
-                bool_mask = mask == i
-
-                order = numpy.arange(bool_mask.sum())
-                numpy.random.shuffle(order)
-                in_arr  = self._h5_fast_bool_ix(h5_in,  bool_mask)[order]
-                out_arr = self._h5_fast_bool_ix(h5_out, bool_mask)[order]
+            with closing(tables.open_file(h5_file, 'r')) as f:
+                h5_in = f.root.input
+                h5_out = f.root.output
                 
-                in_name = '{}-input-chunk-{}'
-                in_name = in_name.format(h5_file, i)
+                mask = numpy.arange(in_rows) % n_chunks
+                numpy.random.shuffle(mask)
                 
-                out_name = '{}-output-chunk-{}'
-                out_name = out_name.format(h5_file, i)
-                
-                yield in_arr, in_name, out_arr, out_name
-            f.close() 
+                for i in range(n_chunks):
+                    bool_mask = mask == i
 
-        self.generator = data_iter
+                    order = numpy.arange(bool_mask.sum())
+                    numpy.random.shuffle(order)
+                    in_arr  = self._h5_fast_bool_ix(h5_in,  bool_mask)[order]
+                    out_arr = self._h5_fast_bool_ix(h5_out, bool_mask)[order]
+                
+                    in_name = '{}-input-chunk-{}'
+                    in_name = in_name.format(h5_file, i)
+                
+                    out_name = '{}-output-chunk-{}'
+                    out_name = out_name.format(h5_file, i)
+                
+                    yield in_arr, in_name, out_arr, out_name
+        return data_iter
+
+    def load_h5_table(self, h5_file, chunksize=40000):
+        with closing(tables.open_file(h5_file, 'r')) as f:
+            self.in_size = f.root.input.shape[1]
+            self.out_size = f.root.output.shape[1]
+        self.generator = self._h5_gen(h5_file, chunksize)
 
     def shape_network(self, layers, gap_size=0):
         in_size = self.in_size
@@ -579,11 +622,10 @@ if __name__ == '__main__':
     shape_group.add_argument('-L', '--num-layers', metavar='integer', type=int, help=helptext('Number of layers. If this option is chosen, the sizes of the layers will be automatically determined using input and output data and a mid-layer size heuristic. Mutually exclusive with the --shape option.'))
     shape_group.add_argument('-s', '--shape', metavar='layer_size', nargs='+', type=int, help=helptext('Shape of network specified as a list of layer sizes, starting with the input layer. Mutually exclusive with the --num-layers option.'))
 
-
     nn_parser.add_argument('-c', '--cv-split', action='store_true', default=True, help=helptext('Set aside a quarter of the training data fur cross-validation (CV) purposes. Test data is assumed to be held separately. Currently, when running multiple training cycles, the entire input dataset will be randomly shuffled, mixing training and CV data from the previous cycle. In that case, it is best to set aside a separate CV dataset. (The CV output can still be useful for monitoring fit within a single cycle.)'))
-    # here add separate CV and Test data inputs, mutually exclusive with '--cv-split'
+    # TODO Here add separate CV and Test data inputs, mutually exclusive with '--cv-split'
     
-    # There needs to be a way to store shape size alongside theta; 
+    # TODO There needs to be a way to store shape size alongside theta; 
     # it is clunky to require all these values to match. Once that's
     # implemented, this will be mutually exclusive with --num-layers. 
     # In the long run there should be separate training, testing, and
@@ -593,7 +635,9 @@ if __name__ == '__main__':
    
     nn_parser.add_argument('-r', '--regularization', metavar='float', default=1, type=float, help=helptext('Regularization factor. Defaults to 1.'))
     nn_parser.add_argument('-i', '--num-iterations', metavar='integer', default=-1, type=int, help=helptext('Number of training iterations. Defaults to 0, in which case a prediction task is assumed.'))
-    nn_parser.add_argument('-v', '--visualizer', metavar='mode', type=str, choices=['markov', 'markov-rand'], help=helptext('Chose visualization mode. Only `markov` and `markov-rand` are impemented (for character prediction).'))
+    nn_parser.add_argument('-n', '--num-cycles', metavar='integer', default=1, type=int, help=helptext('Number of training cycles. If this option is selected, the trainer will cycle over the entire dataset multiple times; the total number of training iterations will then be num_iterations x num_cycles. This is most useful for large datasets that have to be processed in chunks.'))
+    nn_parser.add_argument('-v', '--visualizer', metavar='mode', type=str, choices=['markov', 'markov-rand'], help=helptext('Chose visualization mode. Only `markov` and `markov-rand` are currently impemented (for character prediction).'))
+    nn_parser.add_argument('--check_gradient', metavar='integer', type=int, default=False, help=helptext('Run a diagnostic test on a random sample of gradient values to confirm that backpropagation is correctly implemented.'))
 
     args = nn_parser.parse_args()
 
@@ -613,42 +657,57 @@ if __name__ == '__main__':
     nn = Network(shape)
     if args.theta is not None:
         nn.theta = numpy.load(args.theta)
-
-    for i, (X, xname, Y, yname) in enumerate(training_data):
-        print
-        print "Training Input {}: \n\tX -- {}\n\tY -- {}".format(i, xname, yname)
-        
-        if args.cv_split:
-            (X_tr, X_cv), (Y_tr, Y_cv) = train_cv(X, Y)
-        else:
-            X_tr, Y_tr = X, Y
-        
-        tr = NetworkTrainer(nn, X_tr, Y_tr)
-        
-        tr.train(args.regularization, args.num_iterations)
-        a1, a3, a5 = tr.accuracy_topn(1, 3, 5)
-        print
-        print "Training accuracy:        ", a1
-        print "Training accuracy (top 3):", a3
-        print "Training accuracy (top 5):", a5
-
-        if args.cv_split:
-            tr.update_XY(X_cv, Y_cv)
-            a1, a3, a5 = tr.accuracy_topn(1, 3, 5)
-            print "CV accuracy:              ", a1
-            print "CV accuracy (top 3):      ", a3
-            print "CV accuracy (top 5):      ", a5
-
-            res = tr.get_result()
-            print
-            print "Some predicted results:", res[0:20,:].argmax(axis=1)
-            print "The actual results:    ", Y_cv[0:20,:].argmax(axis=1)
-            print
-
-        if args.visualizer == 'markov':
-            markov_visualizer(nn, X_tr[0:1,:], list(' ' + string.lowercase))
-        elif args.visualizer == 'markov-rand':
-            markov_visualizer(nn, X_tr[0:1,:], list(' ' + string.lowercase), True)
     
+    tr = NetworkTrainer(nn)
+    cv = NetworkTrainer(nn)
+    for cycle in range(args.num_cycles):
+        for i, (X, xname, Y, yname) in enumerate(training_data):
+            print "Training Input {}: \n\tX -- {}\n\tY -- {}".format(i, xname, yname)
+            
+            print "Splitting Data..."
+            if args.cv_split:
+                (X_tr, X_cv), (Y_tr, Y_cv) = train_cv(X, Y)
+            else:
+                X_tr, Y_tr = X, Y
+
+            tr.update_XY(X_tr, Y_tr)
+
+            if args.check_gradient:
+                msg = ('Calculated Gradient: {};'
+                       'Estimated Gradient: {};'
+                       'Error: {}')
+                print "Checking Gradient Calculation..."
+                grad_est_err = tr.check_gradient_sample(nn.theta)
+                for grad, est, err in grad_est_err:
+                    print msg.format(grad, est, err)
+
+            print "Training..."
+            tr.train(args.regularization, args.num_iterations)
+            a1, a3, a5 = tr.accuracy_topn(1, 3, 5)
+            print
+            print "Training accuracy:        ", a1
+            print "Training accuracy (top 3):", a3
+            print "Training accuracy (top 5):", a5
+
+            if args.cv_split:
+                cv.update_XY(X_cv, Y_cv)
+                a1, a3, a5 = cv.accuracy_topn(1, 3, 5)
+                print "CV accuracy:              ", a1
+                print "CV accuracy (top 3):      ", a3
+                print "CV accuracy (top 5):      ", a5
+
+                res = tr.get_result()
+                print
+                print "Some predicted results:", res[0:20,:].argmax(axis=1)
+                print "The actual results:    ", Y_cv[0:20,:].argmax(axis=1)
+                print
+
+            if args.visualizer == 'markov':
+                markov_visualizer(nn, X_tr[0:1,:], list(' ' + string.lowercase))
+                print
+            elif args.visualizer == 'markov-rand':
+                markov_visualizer(nn, X_tr[0:1,:], list(' ' + string.lowercase), True)
+                print
+
     if args.save_theta is not None:
         numpy.save(args.save_theta, nn.theta)
