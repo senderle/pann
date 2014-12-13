@@ -149,16 +149,31 @@ class NetworkTrainer(object):
 
         cost = Y * _log(h) - (1 + Y) * _log(1 - h)
         cost = cost.sum() / n_samples
+        
+        cost += self._cost_reg(thetas, n_samples)
 
+        self.progress_msg.cost = cost
+        return cost
+ 
+    def _cost_reg(self, thetas, n_samples):
+        cost = 0
         reg_factor = self.reg_lambda / (2 * n_samples)
         for t in thetas:
             t2 = t * t
             t2[:,0] = 0
             cost += t2.sum() * reg_factor
-
-        self.progress_msg.cost = cost
         return cost
- 
+
+#    def _cost_reg_sparse(self, thetas, n_samples):
+#        cost = 0
+#        for t in thetas:
+#            t_log = numpy.log(numpy.fabs(t + 0.000001 * (t == 0)))
+#            t_log = t_log * 1.0 / n_samples
+#            pi_t = numpy.exp(t_log.sum())
+#            cost += pi_t
+#        
+#        return cost * self.reg_lambda
+
     def _is_last_theta(self, theta):
         if self._last_theta is None:
             return False
@@ -174,37 +189,6 @@ class NetworkTrainer(object):
             print "wants to know how often it happens in practice." 
             return False
 
-
-#    def gradient(self, theta):
-#        if not self._is_last_theta(theta):
-#            self.network.theta = theta
-#            self._forward_propagation()
-#        avals = self._avals
-#        zvals = self._zvals
-#
-#        thetas = self.network.theta_list
-#        n_samples = self.n_samples
-#
-#        d = avals[-1] - self.Y
-#        dvals = [d]
-#
-#        for t, z in reversed(zip(thetas[1:], zvals)):
-#            d = numpy.dot(d, t)[:,1:]
-#            d *= self._sigmoid_grad(z)
-#            dvals.append(d)
-#
-#        dvals.reverse()
-#
-#        theta_grads = [numpy.dot(d.T, a) / n_samples
-#                       for d, a in zip(dvals, avals)]
-#
-#        for g, t in zip(theta_grads, thetas):
-#            t_tail = self.reg_lambda / n_samples * t
-#            t_tail[:,0] = 0
-#            g += t_tail
-#
-#        return self.network.unroll(theta_grads)
-
     def check_gradient_sample(self, theta, n_samples, eps=10 ** -4):
         grad = self.gradient(theta)
         theta_eps = theta[:]
@@ -217,9 +201,8 @@ class NetworkTrainer(object):
             theta_eps[s] -= 2 * eps
             grad_s -= self.cost(theta_eps)
             grad_s /= 2 * eps
-            grad_err.append((grad[s], grad_s, numpy.fabs(grad_s - grad[s])))
-
-        return grad_err
+            yield grad[s], grad_s, numpy.fabs(grad_s - grad[s])
+            
 
     def gradient(self, theta):
         if not self._is_last_theta(theta):
@@ -245,12 +228,24 @@ class NetworkTrainer(object):
         theta_grads = [numpy.dot(d.T, a) / n_samples
                        for d, a in zip(dvals, avals)]
 
+        self._grad_reg(theta_grads, thetas, n_samples)
+
+        return self.network.unroll(theta_grads)
+
+    def _grad_reg(self, theta_grads, thetas, n_samples):
         for g, t in zip(theta_grads, thetas):
             t_tail = self.reg_lambda / n_samples * t
             t_tail[:,0] = 0
             g += t_tail
 
-        return self.network.unroll(theta_grads)
+#    def _grad_reg_sparse(self, theta_grads, thetas, n_samples):
+#        div1_ns = 1.0 / n_samples
+#        reg_factor = self.reg_lambda * div1_ns
+#        for g, t in zip(theta_grads, thetas):
+#            t_log = numpy.log(numpy.fabs(t + 0.000001 * (t == 0)))
+#            t_log = t_log * div1_ns
+#            pi_t = numpy.exp(t_log.sum())
+#            g += reg_factor * pi_t / t
 
     def train(self, lamb, iters):
         self.reg_lambda = float(lamb)
@@ -412,12 +407,14 @@ def markov_visualizer(network, start, key, sample=False, n_cycles=100):
         n.update_XY(start, fakeY)
 
 class TrainingData(object):
-    def __init__(self):  # eventually make some educated guesses about which classmethod constructor to call
+    def __init__(self, chunk_hint=40000):  
+                         # eventually make some educated guesses about which classmethod constructor to call
                          # by checking if the input is a directory, h5 file, or pair of npy files
         self.generator = lambda: iter(())
         self.data_filename = None
         self.in_size = None
         self.out_size = None
+        self.chunk_hint = chunk_hint
 
     def __iter__(self):
         return self.generator()
@@ -478,12 +475,12 @@ class TrainingData(object):
                 yield in_arr, in_f, out_arr, out_f
         return data_iter
 
-    def _h5_fast_bool_ix(self, h5_array, ix, read_chunksize=100000):
+    def _h5_fast_bool_ix(self, h5_array, ix, read_chunksize=10000):
         '''Iterate over an h5 array chunkwise to select a random subset
         of the array. `h5_array` should be the array itself; `ix` should
         be a boolean index array with as many values as `h5_array` has
         rows, and you can optionally set the number of rows to read per
-        chunk with `read_chunksize` (default is 100000). For some reason
+        chunk with `read_chunksize` (default is 10000). For some reason
         this is much faster than using `ix` to index the array directly.'''
 
         n_chunks = h5_array.shape[0] / read_chunksize
@@ -507,7 +504,7 @@ class TrainingData(object):
     # b[inv_ix] = x
     # (a == b).all() is True
 
-    def _h5_fast_ix(self, h5_array, ix, read_chunksize=100000):
+    def _h5_fast_ix(self, h5_array, ix, read_chunksize=10000):
 
         n_chunks = h5_array.shape[0] / read_chunksize
         slices = [slice(i * read_chunksize, (i + 1) * read_chunksize)
@@ -560,7 +557,9 @@ class TrainingData(object):
                     yield in_arr, in_name, out_arr, out_name
         return data_iter
 
-    def load_h5_table(self, h5_file, chunksize=40000):
+    def load_h5_table(self, h5_file, chunksize=None):
+        if chunksize is None:
+            chunksize = self.chunk_hint
         with closing(tables.open_file(h5_file, 'r')) as f:
             self.in_size = f.root.input.shape[1]
             self.out_size = f.root.output.shape[1]
@@ -610,19 +609,57 @@ def helptext(s):
 
 if __name__ == '__main__':
 
-    nn_parser = argparse.ArgumentParser(description='Feedforward Neural Network.', formatter_class=argparse.RawTextHelpFormatter, add_help=False)
-    nn_parser.add_argument('-h', '--help', action='help', help=helptext('Show this help message and exit.'))
+    #nn_parser = argparse.ArgumentParser(
+    #    description='Feedforward Neural Network.', 
+    #    formatter_class=argparse.RawTextHelpFormatter, 
+    #    add_help=False)
+    # TODO: Decide about whether to out the whitespace
+    #       permanently. It looks better, but now that the
+    #       help screen is so long, I'm having doubts about
+    #       it because it takes up so much space.
+    nn_parser = argparse.ArgumentParser(description='Feedforward Neural Network.')
+    nn_parser.add_argument(
+        '-h', '--help', action='help', 
+        help=helptext('Show this help message and exit.'))
     
     input_group = nn_parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument('-I', '--training-input', type=str, nargs=2, metavar='file', help=helptext('Paths to two numpy-readable files containing input and output for training. Mutually exclusive with the --training-directory option.'))
-    input_group.add_argument('-D', '--training-directory', type=str, metavar='directory', help=helptext('Path to a directory containing training data. Input and output data should be stored in separate directories `input` and `output`. The two folders should contain only training data, and should have an equal number of files. Inputs will be matched to outputs by sorting the filenames. Mutually exclusive with the --training-directory option.'))
-    input_group.add_argument('-5', '--training-h5', type=str, metavar='h5_file', help=helptext('Path to an h5 file containing training data. Input and output data should be stored in arrays `root.input` and `root.output`.')) 
+    input_group.add_argument('-I', '--training-input', 
+        type=str, nargs=2, metavar='file', help=helptext('Paths to two '
+        'numpy-readable files containing input and output for training. '
+        'Mutually exclusive with the --training-directory and --training-h5 '
+        'options.'))
+    input_group.add_argument('-D', '--training-directory', type=str,
+        metavar='directory', help=helptext('Path to a directory containing '
+        'training data. Input and output data should be stored in separate '
+        'directories `input` and `output`. The two folders should contain '
+        'only training data, and should have an equal number of files. '
+        'Inputs will be matched to outputs by sorting the filenames. '
+        'Mutually exclusive with the --training-input and --training-h5 '
+        'options.'))
+    input_group.add_argument('-5', '--training-h5', type=str, 
+        metavar='h5_file', help=helptext('Path to an h5 file containing '
+        'training data. Input and output data should be stored in arrays '
+        '`root.input` and `root.output`.')) 
 
     shape_group = nn_parser.add_mutually_exclusive_group(required=True)
-    shape_group.add_argument('-L', '--num-layers', metavar='integer', type=int, help=helptext('Number of layers. If this option is chosen, the sizes of the layers will be automatically determined using input and output data and a mid-layer size heuristic. Mutually exclusive with the --shape option.'))
-    shape_group.add_argument('-s', '--shape', metavar='layer_size', nargs='+', type=int, help=helptext('Shape of network specified as a list of layer sizes, starting with the input layer. Mutually exclusive with the --num-layers option.'))
+    shape_group.add_argument('-L', '--num-layers', metavar='integer', 
+        type=int, help=helptext('Number of layers. If this option is chosen, '
+        'the sizes of the layers will be automatically determined using '
+        'input and output data and a mid-layer size heuristic. Mutually '
+        'exclusive with the --shape option.'))
+    shape_group.add_argument('-s', '--shape', metavar='layer_size', 
+        nargs='+', type=int, help=helptext('Shape of network specified as a '
+        'list of layer sizes, starting with the input layer. Mutually '
+        'exclusive with the --num-layers option.'))
 
-    nn_parser.add_argument('-c', '--cv-split', action='store_true', default=True, help=helptext('Set aside a quarter of the training data fur cross-validation (CV) purposes. Test data is assumed to be held separately. Currently, when running multiple training cycles, the entire input dataset will be randomly shuffled, mixing training and CV data from the previous cycle. In that case, it is best to set aside a separate CV dataset. (The CV output can still be useful for monitoring fit within a single cycle.)'))
+    nn_parser.add_argument('-c', '--cv-split', action='store_true', 
+        default=True, help=helptext('Set aside a quarter of the training '
+        'data for cross-validation (CV) purposes. Test data is assumed to '
+        'be held separately. Currently, when running multiple training '
+        'cycles, the entire input dataset will be randomly shuffled, mixing '
+        'training and CV data from the previous cycle. In that case, it is '
+        'best to set aside a separate CV dataset. (The CV output can still '
+        'be useful for monitoring fit within a single cycle.)'))
     # TODO Here add separate CV and Test data inputs, mutually exclusive with '--cv-split'
     
     # TODO There needs to be a way to store shape size alongside theta; 
@@ -630,14 +667,41 @@ if __name__ == '__main__':
     # implemented, this will be mutually exclusive with --num-layers. 
     # In the long run there should be separate training, testing, and
     # prediction commands.
-    nn_parser.add_argument('-T', '--theta', metavar='file', help=helptext('Path to a numpy-readable file containing the weights of a trained network, represented as a flattened array. The shape should match that passed to --shape if used as well as the shape of -X and -Y.'))
-    nn_parser.add_argument('-S', '--save-theta', metavar='file', help=helptext('Path to save the current theta values on exit. CAUTION: This currently does nothing to prevent you from overwriting a file, nor does it check that the save location exists.'))
+    nn_parser.add_argument('-T', '--theta', metavar='file', 
+        help=helptext('Path to a numpy-readable file containing the weights '
+        'of a trained network, represented as a flattened array. The shape '
+        'should match that passed to --shape if used as well as the shape '
+        'of -X and -Y.'))
+    nn_parser.add_argument('-S', '--save-theta', metavar='file', 
+        help=helptext('Path to save the current theta values on exit. '
+        'CAUTION: This currently does nothing to prevent you from '
+        'overwriting a file, nor does it check that the save location '
+        'exists.'))
    
-    nn_parser.add_argument('-r', '--regularization', metavar='float', default=1, type=float, help=helptext('Regularization factor. Defaults to 1.'))
-    nn_parser.add_argument('-i', '--num-iterations', metavar='integer', default=-1, type=int, help=helptext('Number of training iterations. Defaults to 0, in which case a prediction task is assumed.'))
-    nn_parser.add_argument('-n', '--num-cycles', metavar='integer', default=1, type=int, help=helptext('Number of training cycles. If this option is selected, the trainer will cycle over the entire dataset multiple times; the total number of training iterations will then be num_iterations x num_cycles. This is most useful for large datasets that have to be processed in chunks.'))
-    nn_parser.add_argument('-v', '--visualizer', metavar='mode', type=str, choices=['markov', 'markov-rand'], help=helptext('Chose visualization mode. Only `markov` and `markov-rand` are currently impemented (for character prediction).'))
-    nn_parser.add_argument('--check_gradient', metavar='integer', type=int, default=False, help=helptext('Run a diagnostic test on a random sample of gradient values to confirm that backpropagation is correctly implemented.'))
+    nn_parser.add_argument('-C', '--chunk-size', metavar='integer', 
+        default=40000, help=helptext('Number of samples to load per chunk '
+        'when training on large datasets stored in h5 files. (When loading '
+        'from pre-chunked data, this value is ignored.) Defaults to 40000.'))
+    nn_parser.add_argument('-r', '--regularization', metavar='float', 
+        default=1, type=float, help=helptext('Regularization factor. '
+        'Defaults to 1.'))
+    nn_parser.add_argument('-i', '--num-iterations', metavar='integer', 
+        default=-1, type=int, help=helptext('Number of training iterations. '
+        'Defaults to 0, in which case a prediction task is assumed.'))
+    nn_parser.add_argument('-n', '--num-cycles', metavar='integer', default=1,
+        type=int, help=helptext('Number of training cycles. If this option '
+        'is selected, the trainer will cycle over the entire dataset '
+        'multiple times; the total number of training iterations will then '
+        'be num_iterations x num_cycles. This is most useful for large '
+        'datasets that have to be processed in chunks.'))
+    nn_parser.add_argument('-v', '--visualizer', metavar='mode', type=str, 
+        choices=['markov', 'markov-rand'], help=helptext('Chose '
+        'visualization mode. Only `markov` and `markov-rand` are currently '
+        'impemented (for character prediction).'))
+    nn_parser.add_argument('--check-gradient', metavar='integer', type=int, 
+        default=False, help=helptext('Run a diagnostic test on a random '
+        'sample of gradient values to confirm that backpropagation is '
+        'correctly implemented.'))
 
     args = nn_parser.parse_args()
 
@@ -646,7 +710,7 @@ if __name__ == '__main__':
     elif args.training_directory is not None:
         training_data = TrainingData.npy_dir(args.training_directory)
     else:
-        training_data = TrainingData.h5_table(args.training_h5)
+        training_data = TrainingData.h5_table(args.training_h5, args.chunk_size)
 
     if args.num_layers is not None:
         shape = training_data.shape_network(args.num_layers, gap_size=0)
@@ -662,7 +726,9 @@ if __name__ == '__main__':
     cv = NetworkTrainer(nn)
     for cycle in range(args.num_cycles):
         for i, (X, xname, Y, yname) in enumerate(training_data):
-            print "Training Input {}: \n\tX -- {}\n\tY -- {}".format(i, xname, yname)
+            print ('Training Input {}: \n\t'
+                   'X -- {}\n\t'
+                   'Y -- {}').format(i, xname, yname)
             
             print "Splitting Data..."
             if args.cv_split:
@@ -673,11 +739,11 @@ if __name__ == '__main__':
             tr.update_XY(X_tr, Y_tr)
 
             if args.check_gradient:
-                msg = ('Calculated Gradient: {};'
-                       'Estimated Gradient: {};'
+                msg = ('Calculated Gradient: {}; '
+                       'Estimated Gradient: {}; '
                        'Error: {}')
                 print "Checking Gradient Calculation..."
-                grad_est_err = tr.check_gradient_sample(nn.theta)
+                grad_est_err = tr.check_gradient_sample(nn.theta, args.check_gradient)
                 for grad, est, err in grad_est_err:
                     print msg.format(grad, est, err)
 
