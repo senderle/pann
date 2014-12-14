@@ -432,8 +432,8 @@ class TrainingData(object):
         return instance
 
     @classmethod
-    def h5_table(cls, h5_file):
-        instance = cls()
+    def h5_table(cls, h5_file, chunk_hint=40000):
+        instance = cls(chunk_hint)
         instance.load_h5_table(h5_file)
         return instance
     
@@ -618,9 +618,9 @@ if __name__ == '__main__':
     #       help screen is so long, I'm having doubts about
     #       it because it takes up so much space.
     nn_parser = argparse.ArgumentParser(description='Feedforward Neural Network.')
-    nn_parser.add_argument(
-        '-h', '--help', action='help', 
-        help=helptext('Show this help message and exit.'))
+    #nn_parser.add_argument(
+    #    '-h', '--help', action='help', 
+    #    help=helptext('Show this help message and exit.'))
     
     input_group = nn_parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument('-I', '--training-input', 
@@ -678,7 +678,7 @@ if __name__ == '__main__':
         'overwriting a file, nor does it check that the save location '
         'exists.'))
    
-    nn_parser.add_argument('-C', '--chunk-size', metavar='integer', 
+    nn_parser.add_argument('-C', '--chunk-size', metavar='integer', type=int,
         default=40000, help=helptext('Number of samples to load per chunk '
         'when training on large datasets stored in h5 files. (When loading '
         'from pre-chunked data, this value is ignored.) Defaults to 40000.'))
@@ -688,8 +688,8 @@ if __name__ == '__main__':
     nn_parser.add_argument('-i', '--num-iterations', metavar='integer', 
         default=-1, type=int, help=helptext('Number of training iterations. '
         'Defaults to 0, in which case a prediction task is assumed.'))
-    nn_parser.add_argument('-n', '--num-cycles', metavar='integer', default=1,
-        type=int, help=helptext('Number of training cycles. If this option '
+    nn_parser.add_argument('-n', '--num-cycles', metavar='integer', type=int,
+        default=1, help=helptext('Number of training cycles. If this option '
         'is selected, the trainer will cycle over the entire dataset '
         'multiple times; the total number of training iterations will then '
         'be num_iterations x num_cycles. This is most useful for large '
