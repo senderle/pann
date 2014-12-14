@@ -475,7 +475,7 @@ class TrainingData(object):
                 yield in_arr, in_f, out_arr, out_f
         return data_iter
 
-    def _h5_fast_bool_ix(self, h5_array, ix, read_chunksize=10000):
+    def _h5_fast_bool_ix(self, h5_array, ix, read_chunksize=30000):
         '''Iterate over an h5 array chunkwise to select a random subset
         of the array. `h5_array` should be the array itself; `ix` should
         be a boolean index array with as many values as `h5_array` has
@@ -504,7 +504,7 @@ class TrainingData(object):
     # b[inv_ix] = x
     # (a == b).all() is True
 
-    def _h5_fast_ix(self, h5_array, ix, read_chunksize=10000):
+    def _h5_fast_ix(self, h5_array, ix, read_chunksize=30000):
 
         n_chunks = h5_array.shape[0] / read_chunksize
         slices = [slice(i * read_chunksize, (i + 1) * read_chunksize)
@@ -747,8 +747,10 @@ if __name__ == '__main__':
                 for grad, est, err in grad_est_err:
                     print msg.format(grad, est, err)
 
-            print "Training..."
-            tr.train(args.regularization, args.num_iterations)
+            if args.num_iterations > 0:
+                print "Training..."
+                tr.train(args.regularization, args.num_iterations)
+            
             a1, a3, a5 = tr.accuracy_topn(1, 3, 5)
             print
             print "Training accuracy:        ", a1
@@ -762,7 +764,7 @@ if __name__ == '__main__':
                 print "CV accuracy (top 3):      ", a3
                 print "CV accuracy (top 5):      ", a5
 
-                res = tr.get_result()
+                res = cv.get_result()
                 print
                 print "Some predicted results:", res[0:20,:].argmax(axis=1)
                 print "The actual results:    ", Y_cv[0:20,:].argmax(axis=1)
