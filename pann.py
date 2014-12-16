@@ -289,7 +289,7 @@ class NetworkTrainer(object):
         self._forward_propagation()
         h = self._avals[-1]
         if sample:
-            h = h[0] ** 1.3   # to weed out the less common letters
+            h = h[0] ** 1 # 1.3  # to weed out the less common letters
             return numpy.random.multinomial(1, h / h.sum())
         else:
             return h.argmax(axis=1)[:,None] == numpy.arange(h.shape[1])[None,:]
@@ -401,7 +401,13 @@ def markov_visualizer(network, start, key, sample=False, n_cycles=100):
         r = n.get_result(sample).astype(float)
         s = start[0].reshape(-1, n_labels)
 
-        print ''.join(key[char.nonzero()[0][0]] for char in s)
+        try:
+            print ''.join(key[char.nonzero()[0][0]] for char in s)
+        except IndexError:
+            print "You've discovered the heisenbug. Please send the"
+            print "following information to scott.enderle@gmail.com:"
+            print [char.nonzero() for char in s]
+            break
         start[:,0:n_features - n_labels] = start[:,n_labels:]
         start[:,n_features - n_labels:] = r
         n.update_XY(start, fakeY)
@@ -607,8 +613,7 @@ def helptext(s):
     txt = ['\n', textwrapper(s), '\n\n']
     return ''.join(txt)
 
-if __name__ == '__main__':
-
+def build_parser():
     #nn_parser = argparse.ArgumentParser(
     #    description='Feedforward Neural Network.', 
     #    formatter_class=argparse.RawTextHelpFormatter, 
@@ -703,7 +708,11 @@ if __name__ == '__main__':
         'sample of gradient values to confirm that backpropagation is '
         'correctly implemented.'))
 
-    args = nn_parser.parse_args()
+    return nn_parser
+
+if __name__ == '__main__':
+
+    args = build_parser().parse_args()
 
     if args.training_input is not None:
         training_data = TrainingData.npy_single(args.training_input)
