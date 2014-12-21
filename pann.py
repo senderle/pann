@@ -28,7 +28,7 @@ import math
 import string
 import time
 import argparse
-import os.path
+import os
 import itertools
 import random
 from textwrap import TextWrapper
@@ -795,4 +795,4 @@ if __name__ == '__main__':
             tmpname = '.temp_' + args.save_theta
             numpy.save(tmpname, nn.theta)
     if args.save_theta is not None:
-        numpy.save(args.save_theta, nn.theta)
+        os.rename('.temp_' + args.save_theta, args.save_theta)
