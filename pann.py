@@ -254,10 +254,13 @@ class NetworkTrainer(object):
                                        self.network.theta, 
                                        self.gradient, 
                                        maxiter=iters,
-                                       disp=False,
-                                       callback=callback)
+                                       callback=callback,
+                                       disp=False)
         self.progress_msg.reset()
         self.network.theta = theta
+
+    def fmin(self, cost, theta, gradient, maxiter, callback, disp=None):
+        pass
 
     def accuracy(self):
         self._forward_propagation()
@@ -289,7 +292,7 @@ class NetworkTrainer(object):
         self._forward_propagation()
         h = self._avals[-1]
         if sample:
-            h = h[0] ** 1 # 1.3  # to weed out the less common letters
+            h = h[0] ** 2  # to weed out the less common letters
             return numpy.random.multinomial(1, h / h.sum())
         else:
             return h.argmax(axis=1)[:,None] == numpy.arange(h.shape[1])[None,:]
@@ -406,6 +409,7 @@ def markov_visualizer(network, start, key, sample=False, n_cycles=100):
         except IndexError:
             print "You've discovered the heisenbug. Please send the"
             print "following information to scott.enderle@gmail.com:"
+            print (r.ravel() != 0).sum()
             print [char.nonzero() for char in s]
             break
         start[:,0:n_features - n_labels] = start[:,n_labels:]
@@ -735,9 +739,10 @@ if __name__ == '__main__':
     cv = NetworkTrainer(nn)
     for cycle in range(args.num_cycles):
         for i, (X, xname, Y, yname) in enumerate(training_data):
-            print ('Training Input {}: \n\t'
+            print ('Cycle {}\n'
+                   'Training Input {}: \n\t'
                    'X -- {}\n\t'
-                   'Y -- {}').format(i, xname, yname)
+                   'Y -- {}').format(cycle, i, xname, yname)
             
             print "Splitting Data..."
             if args.cv_split:
@@ -786,5 +791,8 @@ if __name__ == '__main__':
                 markov_visualizer(nn, X_tr[0:1,:], list(' ' + string.lowercase), True)
                 print
 
+        if args.save_theta is not None:
+            tmpname = '.temp_' + args.save_theta
+            numpy.save(tmpname, nn.theta)
     if args.save_theta is not None:
         numpy.save(args.save_theta, nn.theta)
