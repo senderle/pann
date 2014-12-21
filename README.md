@@ -1,3 +1,8 @@
+pann
+====
+
+A simple feed forward neural network trainer. 
+
 My goal is to create an application for training feed forward networks on 
 large quantitites of data. Right now it can handle several million training
 instances in a reasonable way. I want it to handle several hundred million, 
