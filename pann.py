@@ -288,6 +288,10 @@ class NetworkTrainer(object):
 
         return results
 
+    def entropy(self):
+        probs = self.h[self.Y.nonzero()]
+        return -(numpy.log2(probs)).sum() / self.Y.shape[0]
+
     def get_result(self, sample=False):
         self._forward_propagation()
         h = self._avals[-1]
@@ -409,8 +413,8 @@ def markov_visualizer(network, start, key, sample=False, n_cycles=100):
         except IndexError:
             print "You've discovered the heisenbug. Please send the"
             print "following information to scott.enderle@gmail.com:"
-            print (r.ravel() != 0).sum()
-            print [char.nonzero() for char in s]
+            print (s.ravel() != 0).sum()
+            print s.shape
             break
         start[:,0:n_features - n_labels] = start[:,n_labels:]
         start[:,n_features - n_labels:] = r
@@ -612,33 +616,16 @@ def train_cv(X, Y):
     
     return X_data, Y_data
 
-textwrapper = TextWrapper(width=55).fill
-def helptext(s):
-    txt = ['\n', textwrapper(s), '\n\n']
-    return ''.join(txt)
-
 def build_parser():
-    #nn_parser = argparse.ArgumentParser(
-    #    description='Feedforward Neural Network.', 
-    #    formatter_class=argparse.RawTextHelpFormatter, 
-    #    add_help=False)
-    # TODO: Decide about whether to out the whitespace
-    #       permanently. It looks better, but now that the
-    #       help screen is so long, I'm having doubts about
-    #       it because it takes up so much space.
     nn_parser = argparse.ArgumentParser(description='Feedforward Neural Network.')
-    #nn_parser.add_argument(
-    #    '-h', '--help', action='help', 
-    #    help=helptext('Show this help message and exit.'))
-    
     input_group = nn_parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument('-I', '--training-input', 
-        type=str, nargs=2, metavar='file', help=helptext('Paths to two '
+        type=str, nargs=2, metavar='file', help=('Paths to two '
         'numpy-readable files containing input and output for training. '
         'Mutually exclusive with the --training-directory and --training-h5 '
         'options.'))
     input_group.add_argument('-D', '--training-directory', type=str,
-        metavar='directory', help=helptext('Path to a directory containing '
+        metavar='directory', help=('Path to a directory containing '
         'training data. Input and output data should be stored in separate '
         'directories `input` and `output`. The two folders should contain '
         'only training data, and should have an equal number of files. '
@@ -646,23 +633,23 @@ def build_parser():
         'Mutually exclusive with the --training-input and --training-h5 '
         'options.'))
     input_group.add_argument('-5', '--training-h5', type=str, 
-        metavar='h5_file', help=helptext('Path to an h5 file containing '
+        metavar='h5_file', help=('Path to an h5 file containing '
         'training data. Input and output data should be stored in arrays '
         '`root.input` and `root.output`.')) 
 
     shape_group = nn_parser.add_mutually_exclusive_group(required=True)
     shape_group.add_argument('-L', '--num-layers', metavar='integer', 
-        type=int, help=helptext('Number of layers. If this option is chosen, '
+        type=int, help=('Number of layers. If this option is chosen, '
         'the sizes of the layers will be automatically determined using '
         'input and output data and a mid-layer size heuristic. Mutually '
         'exclusive with the --shape option.'))
     shape_group.add_argument('-s', '--shape', metavar='layer_size', 
-        nargs='+', type=int, help=helptext('Shape of network specified as a '
+        nargs='+', type=int, help=('Shape of network specified as a '
         'list of layer sizes, starting with the input layer. Mutually '
         'exclusive with the --num-layers option.'))
 
     nn_parser.add_argument('-c', '--cv-split', action='store_true', 
-        default=True, help=helptext('Set aside a quarter of the training '
+        default=False, help=('Set aside a quarter of the training '
         'data for cross-validation (CV) purposes. Test data is assumed to '
         'be held separately. Currently, when running multiple training '
         'cycles, the entire input dataset will be randomly shuffled, mixing '
@@ -677,38 +664,38 @@ def build_parser():
     # In the long run there should be separate training, testing, and
     # prediction commands.
     nn_parser.add_argument('-T', '--theta', metavar='file', 
-        help=helptext('Path to a numpy-readable file containing the weights '
+        help=('Path to a numpy-readable file containing the weights '
         'of a trained network, represented as a flattened array. The shape '
         'should match that passed to --shape if used as well as the shape '
         'of -X and -Y.'))
     nn_parser.add_argument('-S', '--save-theta', metavar='file', 
-        help=helptext('Path to save the current theta values on exit. '
+        help=('Path to save the current theta values on exit. '
         'CAUTION: This currently does nothing to prevent you from '
         'overwriting a file, nor does it check that the save location '
         'exists.'))
    
     nn_parser.add_argument('-C', '--chunk-size', metavar='integer', type=int,
-        default=40000, help=helptext('Number of samples to load per chunk '
+        default=40000, help=('Number of samples to load per chunk '
         'when training on large datasets stored in h5 files. (When loading '
         'from pre-chunked data, this value is ignored.) Defaults to 40000.'))
     nn_parser.add_argument('-r', '--regularization', metavar='float', 
-        default=1, type=float, help=helptext('Regularization factor. '
+        default=1, type=float, help=('Regularization factor. '
         'Defaults to 1.'))
     nn_parser.add_argument('-i', '--num-iterations', metavar='integer', 
-        default=-1, type=int, help=helptext('Number of training iterations. '
+        default=-1, type=int, help=('Number of training iterations. '
         'Defaults to 0, in which case a prediction task is assumed.'))
     nn_parser.add_argument('-n', '--num-cycles', metavar='integer', type=int,
-        default=1, help=helptext('Number of training cycles. If this option '
+        default=1, help=('Number of training cycles. If this option '
         'is selected, the trainer will cycle over the entire dataset '
         'multiple times; the total number of training iterations will then '
         'be num_iterations x num_cycles. This is most useful for large '
         'datasets that have to be processed in chunks.'))
     nn_parser.add_argument('-v', '--visualizer', metavar='mode', type=str, 
-        choices=['markov', 'markov-rand'], help=helptext('Chose '
+        choices=['markov', 'markov-rand'], help=('Chose '
         'visualization mode. Only `markov` and `markov-rand` are currently '
         'impemented (for character prediction).'))
     nn_parser.add_argument('--check-gradient', metavar='integer', type=int, 
-        default=False, help=helptext('Run a diagnostic test on a random '
+        default=False, help=('Run a diagnostic test on a random '
         'sample of gradient values to confirm that backpropagation is '
         'correctly implemented.'))
 
@@ -739,7 +726,7 @@ if __name__ == '__main__':
     cv = NetworkTrainer(nn)
     for cycle in range(args.num_cycles):
         for i, (X, xname, Y, yname) in enumerate(training_data):
-            print ('Cycle {}\n'
+            print ('Cycle {}, '
                    'Training Input {}: \n\t'
                    'X -- {}\n\t'
                    'Y -- {}').format(cycle, i, xname, yname)
@@ -770,6 +757,7 @@ if __name__ == '__main__':
             print "Training accuracy:        ", a1
             print "Training accuracy (top 3):", a3
             print "Training accuracy (top 5):", a5
+            print "Training entropy:         ", tr.entropy()
 
             if args.cv_split:
                 cv.update_XY(X_cv, Y_cv)
@@ -777,6 +765,7 @@ if __name__ == '__main__':
                 print "CV accuracy:              ", a1
                 print "CV accuracy (top 3):      ", a3
                 print "CV accuracy (top 5):      ", a5
+                print "CV entropy:               ", cv.entropy()
 
                 res = cv.get_result()
                 print
@@ -795,4 +784,9 @@ if __name__ == '__main__':
             tmpname = '.temp_' + args.save_theta
             numpy.save(tmpname, nn.theta)
     if args.save_theta is not None:
-        os.rename('.temp_' + args.save_theta, args.save_theta)
+        if not args.save_theta.endswith('.npy'):
+            savename = args.save_theta + '.npy'
+        try:
+            os.rename('.temp_' + savename, savename)
+        except OSError:
+            numpy.save(savename, nn.theta)
