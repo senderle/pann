@@ -34,37 +34,146 @@ import random
 from textwrap import TextWrapper
 from contextlib import closing
 
-class NetworkTrainer(object):
+# TODO:
+
+# I have thought about it and before I can do any of the below, I 
+# need to do more to decouple training, testing, and application,
+# or else I need to bite the bullet and accept that there's going 
+# to be one gigantic object that has methods for all three. 
+# In which case they should be absolutely bare-bones and produce
+# output in a form that's easy to manipulate further. 
+
+# 1) Implement plugins for visualization
+# 2) Implement plugins for data input
+# 3) Separate training loop from main
+# 4) Add an `out` parameter to `unroll`
+# 5) Store shape with Theta data, probably using H5. 
+
+# In the long run -- optimization plug-ins? Network shape plug-ins?
+# Reimplement numpy training data input?
+
+# REFLECTIONS ON THE NETWORK INTERFACE
+
+# Neural networks have a lot of complexity, and I think that hiding that
+# complexity is important if the class used for training is to be used
+# outside this module. With that in mind, I've implemented an experimental
+# copying and "cloning" interface that allows for basic manipulation of shared
+# state (network weights) in a way that doesn't demand a lot of bookkeeping
+# in the calling module. Copies are straight-up copies; clones are copies
+# with some shared state. The shared state consists only of network weights; 
+# changes to the weights of one clone affect all clones. But training data
+# is not shared. This means we can do complex things like have one clone
+# training, and have another clone doing cross-validation without having to
+# update state directly all the time. But it also means we don't have to 
+# manage or know anything at all about how network weights are stored, and
+# so on. That's all managed by the Network itself. We just pass it a shape
+# and let it go. 
+
+# There _is_ a public interface for accessing weights, but
+# it's very simple -- just a flat array of weights, or a (write-only) 
+# property that returns the weights separated into different matrices. This
+# is useful for visualizing the weight matrices (which is something that
+# we can expect the visualizing module to understand). But I don't expect
+# the weight accessors to be very useful otherwise.
+
+# I'm not certain this is the right solution, but it has a certain conceptual
+# clarity that appeals to me, compared to the insane complexity of dealing
+# with things like conversions between shapes that do or do not include
+# bias units and so on. That stuff really shouldn't be exposed. I'll
+# have to think more about the canonical representation of a network's
+# _shape_ but that's going to have to evolve from here. 
+
+class Network(object):
     '''A class for training feedforward networks of arbitrary sizes.
     Networks deeper than four layers are unlikely to train well; future
     versions of this program will include support for auto-encoders and
     other pre-trainers appropriate for deep learning problems.'''
 
-    def __init__(self, network, X=None, Y=None):
- 
-        self.network = network
-        self.reg_lambda = 1
-        self.progress_msg = ProgressMessage()
+    def __init__(self, shape, X=None, Y=None, logger=None):
+        self._shape = shape
+        self._weights = _Weights(shape)
         
-        self._n_samples = 0
-        self._avals = []
-        self._zvals = []
-        self._dvals = []
+        self._reg_lambda = 0
+        self._n_samples = None
+        self._avals = None
+        self._zvals = None
+        self._dvals = None
+        self._Y = None
+        
+        if logger is None:
+            self._logger = OutputLogger(dummy=True)
+        else:
+            self._logger = logger
+        self._callback = self._logger.update_progress
 
         if X is not None and Y is not None:
             self.update_XY(X, Y)
         elif X is not None or Y is not None:
-            raise ValueError("NetworkTrainer(): Both X and Y must be supplied, or neither.")
-       
-    def update_XY(self, X, Y):
-        self._last_theta = None     # This is a crucial step for correctness for reasons that aren't obvious based
-                                    # on the name or the code. I don't like that. The issue is that if this value
-                                    # isn't reset to None at this point, then it's possible for backprop to run
-                                    # on the values from foward propagation from the _previous_ set of XY values.
-                                    # Unfortunately, I can't think of a better way to manage this. 
+            raise ValueError("Both X and Y must be supplied, or neither.")
 
-        if (not X.shape[1] + 1 == self.network.shape[0] or 
-            not Y.shape[1] == self.network.shape[-1]):
+    def _duplicate(self, X, Y, logger):
+        if X is None and Y is None:
+            X = self.X
+            Y = self.Y
+        new = Network(self._shape, X, Y, logger)
+        return new
+
+    def copy(self, X=None, Y=None, logger=None):
+        new = self._duplicate(X, Y, logger)
+        new.theta = self.theta
+        return new
+
+    def clone(self, X=None, Y=None):
+        new = self._duplicate(X, Y, logger)
+        new._weights = self._weights
+        return new
+
+    def is_clone(self, other):
+        return self._weights is other._weights
+
+    @property
+    def X(self):
+        if self._avals is None:
+            return None
+        else:
+            return self._avals[0][:,1:]
+
+    @property
+    def Y(self):
+        return self._Y
+
+    @property
+    def n_samples(self):
+        return self._n_samples
+
+    @property
+    def theta(self):
+        return self._weights.theta
+
+    @theta.setter
+    def theta(self, theta):
+        self._weights.theta = theta
+
+    @property
+    def theta_list(self):
+        return self._weights.theta_list
+
+    def load_theta(self, path):
+        self.theta = numpy.load(path)
+
+    def save_theta(self, path):
+        numpy.save(path, self.theta)
+
+    def update_XY(self, X, Y):
+        self._last_theta = None     # This is a crucial step for correctness 
+        # for reasons that aren't obvious based on the name or the code. I 
+        # don't like that. The issue is that if this value isn't reset to 
+        # None at this point, then it's possible for backprop to run on the 
+        # values from foward propagation from the _previous_ set of XY 
+        # values. Unfortunately I can't think of a better way to manage this. 
+
+        if (not X.shape[1] == self._shape[0] or 
+            not Y.shape[1] == self._shape[-1]):
             raise ValueError("Network shape and training data are not aligned.")
         if not X.shape[0] == Y.shape[0]:
             raise ValueError("Number of inputs does not match number of outputs in training data.")
@@ -79,7 +188,7 @@ class NetworkTrainer(object):
                 d[:] = 1
         else:
             self._n_samples = n_samples
-            ashapes, zshapes = self.network.azshapes(n_samples)
+            ashapes, zshapes = self._weights.azshapes(n_samples)
             self._avals = [numpy.ones(s) for s in ashapes]
             self._zvals = [numpy.ones(s) for s in zshapes]
             self._dvals = [numpy.ones(s) for s in zshapes]
@@ -88,179 +197,46 @@ class NetworkTrainer(object):
         self._avals[0][:,1:] = X
         self._Y = Y
 
-    @property
-    def X(self):
-        return self._avals[0][:,1:]
+    def train_cg(self, iters, reg):
+        if self._n_samples is None:
+            return
+        
+        if self._logger is not None:
+            self._logger.reset_progress()
 
-    @property
-    def Y(self):
-        return self._Y
+        self._reg_lambda = float(reg)
+        theta = scipy.optimize.fmin_cg(self._cost, 
+                                       self.theta, 
+                                       self._gradient, 
+                                       maxiter=iters,
+                                       callback=self._callback,
+                                       disp=False)
+        self.theta = theta
 
-    @property
-    def h(self):
+    def train_sgd(self, iters, reg, alpha):
+        if self._n_samples is None:
+            return
+
+        if self._logger is not None:
+            self._logger.reset_progress()
+
+        theta = self.theta
+        self._reg_lambda = float(reg)
+
+        for _ in xrange(iters):
+            self._cost(theta)
+            theta -= alpha * self._gradient(theta)
+            self._callback()
+        
+        self.theta = theta
+
+    def predict(self):
+        self._forward_propagation()
         return self._avals[-1]
 
-    @property
-    def n_samples(self):
-        return self._n_samples
-
-    @staticmethod
-    def _sigmoid(x, _exp=numpy.exp):
-        ex = _exp(-x)
-        ex += 1
-        return 1 / ex
-
-    @staticmethod
-    def _sigmoid_grad(x, _exp=numpy.exp):
-        ex = _exp(-x)
-        ex_1 = ex + 1
-        ex /= ex_1 * ex_1
-        return ex
-
-    def _forward_propagation(self):
-        thetas = self.network.theta_list
-        avals = self._avals
-        zvals = self._zvals
-
-        a_in = avals[0]
-        mid_layers = zip(avals[1:], zvals, thetas)
-        out_layer = mid_layers.pop()
-
-        for a, z, t in mid_layers:
-            numpy.dot(a_in, t.T, out=z)
-            a[:,1:] = self._sigmoid(z)
-            a_in = a
-        
-        a, z, t = out_layer
-        z[:] = numpy.dot(a_in, t.T)
-        a[:] = self._sigmoid(z)
-
-    def cost(self, theta, _log=numpy.log):
-        self.network.theta = theta
-        self._last_theta = theta
-        
-        thetas = self.network.theta_list
-        n_samples = self.n_samples
-        
-        self._forward_propagation()
-
-        h = self._avals[-1]
-        Y = -self.Y
-
-        cost = Y * _log(h) - (1 + Y) * _log(1 - h)
-        cost = cost.sum() / n_samples
-        
-        cost += self._cost_reg(thetas, n_samples)
-
-        self.progress_msg.cost = cost
-        return cost
- 
-    def _cost_reg(self, thetas, n_samples):
-        cost = 0
-        reg_factor = self.reg_lambda / (2 * n_samples)
-        for t in thetas:
-            t2 = t * t
-            t2[:,0] = 0
-            cost += t2.sum() * reg_factor
-        return cost
-
-#    def _cost_reg_sparse(self, thetas, n_samples):
-#        cost = 0
-#        for t in thetas:
-#            t_log = numpy.log(numpy.fabs(t + 0.000001 * (t == 0)))
-#            t_log = t_log * 1.0 / n_samples
-#            pi_t = numpy.exp(t_log.sum())
-#            cost += pi_t
-#        
-#        return cost * self.reg_lambda
-
-    def _is_last_theta(self, theta):
-        if self._last_theta is None:
-            return False
-        elif theta[0] != self._last_theta[0]:
-            return False
-        elif (theta == self._last_theta).all():
-            return True
-        else:
-            print "First theta vals matched, but not _is_last_theta!"
-            print "This should be an extremely rare event. It can"
-            print "safely be ignored. However, feel free to contact"
-            print "scott.enderle@gmail.com if it happens to you. He"
-            print "wants to know how often it happens in practice." 
-            return False
-
-    def check_gradient_sample(self, theta, n_samples, eps=10 ** -4):
-        grad = self.gradient(theta)
-        theta_eps = theta[:]
-
-        samples = numpy.random.randint(0, theta.size, n_samples)
-        grad_err = []
-        for s in samples:
-            theta_eps[s] += eps
-            grad_s = self.cost(theta_eps)
-            theta_eps[s] -= 2 * eps
-            grad_s -= self.cost(theta_eps)
-            grad_s /= 2 * eps
-            yield grad[s], grad_s, numpy.fabs(grad_s - grad[s])
-            
-
-    def gradient(self, theta):
-        if not self._is_last_theta(theta):
-            self.network.theta = theta
-            self._forward_propagation()
-        
-        avals = self._avals
-        zvals = self._zvals
-        dvals = self._dvals
-        
-        thetas = self.network.theta_list
-        n_samples = self.n_samples
-
-        dvals[-1][:] = avals[-1]
-        dvals[-1] -= self.Y
-
-        # propagate error terms in reverse
-        t_z_dprev_dnext = zip(thetas[1:], zvals, dvals, dvals[1:])
-        for t, z, dprev, dnext in reversed(t_z_dprev_dnext):
-            numpy.dot(dnext, t[:,1:], out=dprev)
-            dprev *= self._sigmoid_grad(z)
-
-        theta_grads = [numpy.dot(d.T, a) / n_samples
-                       for d, a in zip(dvals, avals)]
-
-        self._grad_reg(theta_grads, thetas, n_samples)
-
-        return self.network.unroll(theta_grads)
-
-    def _grad_reg(self, theta_grads, thetas, n_samples):
-        for g, t in zip(theta_grads, thetas):
-            t_tail = self.reg_lambda / n_samples * t
-            t_tail[:,0] = 0
-            g += t_tail
-
-#    def _grad_reg_sparse(self, theta_grads, thetas, n_samples):
-#        div1_ns = 1.0 / n_samples
-#        reg_factor = self.reg_lambda * div1_ns
-#        for g, t in zip(theta_grads, thetas):
-#            t_log = numpy.log(numpy.fabs(t + 0.000001 * (t == 0)))
-#            t_log = t_log * div1_ns
-#            pi_t = numpy.exp(t_log.sum())
-#            g += reg_factor * pi_t / t
-
-    def train(self, lamb, iters):
-        self.reg_lambda = float(lamb)
-        callback = self.progress_msg.update
-        theta = scipy.optimize.fmin_cg(self.cost, 
-                                       self.network.theta, 
-                                       self.gradient, 
-                                       maxiter=iters,
-                                       callback=callback,
-                                       disp=False)
-        self.progress_msg.reset()
-        self.network.theta = theta
-
-    def fmin(self, cost, theta, gradient, maxiter, callback, disp=None):
-        pass
+    # Consider moving this accuracy stuff into a new class; the class 
+    # interface is just about the right size here; the below methods 
+    # expand it a bit too much.
 
     def accuracy(self):
         self._forward_propagation()
@@ -289,19 +265,146 @@ class NetworkTrainer(object):
         return results
 
     def entropy(self):
-        probs = self.h[self.Y.nonzero()]
+        h = self._avals[-1]
+        probs = h[self.Y.nonzero()]
         return -(numpy.log2(probs)).sum() / self.Y.shape[0]
 
-    def get_result(self, sample=False):
-        self._forward_propagation()
-        h = self._avals[-1]
-        if sample:
-            h = h[0] ** 2  # to weed out the less common letters
-            return numpy.random.multinomial(1, h / h.sum())
-        else:
-            return h.argmax(axis=1)[:,None] == numpy.arange(h.shape[1])[None,:]
+    # The following is really only ever for testing, but it's quite important
+    # so I'm leaving it as part of the public interface for now. 
 
-class Network(object):
+    def check_gradient_sample(self, theta, n_trials, eps=10 ** -4):
+        if self._n_samples is None:
+            return
+        
+        grad = self._gradient(theta)
+        theta_eps = theta[:]
+
+        samples = numpy.random.randint(0, theta.size, n_trials)
+        grad_err = []
+        for s in samples:
+            theta_eps[s] += eps
+            grad_s = self._cost(theta_eps)
+            theta_eps[s] -= 2 * eps
+            grad_s -= self._cost(theta_eps)
+            grad_s /= 2 * eps
+            yield grad[s], grad_s, numpy.fabs(grad_s - grad[s])
+
+    @staticmethod
+    def _sigmoid(x, _exp=numpy.exp):
+        ex = _exp(-x)
+        ex += 1
+        return 1 / ex
+
+    @staticmethod
+    def _sigmoid_grad(x, _exp=numpy.exp):
+        ex = _exp(-x)
+        ex_1 = ex + 1
+        ex /= ex_1 * ex_1
+        return ex
+
+    def _forward_propagation(self):
+        thetas = self.theta_list
+        avals = self._avals
+        zvals = self._zvals
+
+        a_in = avals[0]
+        mid_layers = zip(avals[1:], zvals, thetas)
+        out_layer = mid_layers.pop()
+
+        for a, z, t in mid_layers:
+            numpy.dot(a_in, t.T, out=z)
+            a[:,1:] = self._sigmoid(z)
+            a_in = a
+        
+        a, z, t = out_layer
+        z[:] = numpy.dot(a_in, t.T)
+        a[:] = self._sigmoid(z)
+
+    def _cost(self, theta, _log=numpy.log):
+        self.theta = theta
+        self._last_theta = theta
+        
+        thetas = self.theta_list
+        n_samples = self.n_samples
+        
+        self._forward_propagation()
+
+        h = self._avals[-1]
+        Y = -self.Y
+
+        cost = Y * _log(h) - (1 + Y) * _log(1 - h)
+        cost = cost.sum() / n_samples
+        
+        cost += self._cost_reg(thetas, n_samples)
+
+        if self._logger is not None:
+            self._logger.update_cost(cost)
+        return cost
+ 
+    def _cost_reg(self, thetas, n_samples):
+        cost = 0
+        reg_factor = self._reg_lambda / (2 * n_samples)
+        for t in thetas:
+            t2 = t * t
+            t2[:,0] = 0
+            cost += t2.sum() * reg_factor
+        return cost
+
+    def _is_last_theta(self, theta):
+        if self._last_theta is None:
+            return False
+        elif theta[0] != self._last_theta[0]:
+            return False
+        elif (theta == self._last_theta).all():
+            return True
+        else:
+            print "First theta vals matched, but not _is_last_theta!"
+            print "This should be an extremely rare event. It can"
+            print "safely be ignored. However, feel free to contact"
+            print "scott.enderle@gmail.com if it happens to you. He"
+            print "wants to know how often it happens in practice." 
+            return False
+           
+    def _gradient(self, theta):
+        # Calculating the gradient requires information produced when the 
+        # cost is calculated. Unfortunately, fmin_cg treats the two as 
+        # separate functions, so a straightforward calculation of the
+        # gradient requires us to duplicate effort. Instead, we reuse
+        # information from the cost calculation when theta is the same.
+        if not self._is_last_theta(theta):
+            self.theta = theta
+            self._forward_propagation()
+        
+        avals = self._avals
+        zvals = self._zvals
+        dvals = self._dvals
+        
+        thetas = self.theta_list
+        n_samples = self.n_samples
+
+        dvals[-1][:] = avals[-1]
+        dvals[-1] -= self.Y
+
+        # propagate error terms in reverse
+        t_z_dprev_dnext = zip(thetas[1:], zvals, dvals, dvals[1:])
+        for t, z, dprev, dnext in reversed(t_z_dprev_dnext):
+            numpy.dot(dnext, t[:,1:], out=dprev)
+            dprev *= self._sigmoid_grad(z)
+
+        theta_grads = [numpy.dot(d.T, a) / n_samples
+                       for d, a in zip(dvals, avals)]
+
+        self._grad_reg(theta_grads, thetas, n_samples)
+
+        return self._weights.unroll(theta_grads)
+
+    def _grad_reg(self, theta_grads, thetas, n_samples):
+        for g, t in zip(theta_grads, thetas):
+            t_tail = self._reg_lambda / n_samples * t
+            t_tail[:,0] = 0
+            g += t_tail
+
+class _Weights(object):
     def __init__(self, shape):
         shape = tuple(shape)
         shapes = []
@@ -313,7 +416,7 @@ class Network(object):
             ranges.append((size, size + rows * cols))
             size += rows * cols
         
-        self.shape = (shape[0] + 1,) + shape[1:]
+        self._shape = (shape[0] + 1,) + shape[1:]
         self._theta_shapes = shapes
         self._theta_ranges = ranges
         self._theta_size = size
@@ -324,23 +427,23 @@ class Network(object):
     def theta_list(self):
         return self.rollup(self._theta)
 
-    @theta_list.setter
-    def theta_list(self, theta):
-        self._theta = self.unroll(theta)
-
     @property
     def theta(self):
         return self._theta
 
     @theta.setter
     def theta(self, theta):
-        self._theta = theta
+        self._theta[:] = theta
+
+    @property
+    def shape(self):
+        return self._shape
 
     def azshapes(self, n_samples):
         '''Given a number of samples for training, determine the shape
         of the activation and z matrices. This is useful for preallocating
         and reusing memory for these matrices, which can be quite large.'''
-        shape = self.shape
+        shape = self._shape
 
         ashapes = [(n_samples, shape[0])]
         # inner layers have additional bias units
@@ -370,144 +473,183 @@ class Network(object):
             theta[start:end] = t.ravel()
         return theta
 
-class ProgressMessage(object):
-    def __init__(self, count=0):
-        self.message = ('Iteration {}: ' 
-                        'Cost: {:6.4f} | Time Elapsed: {:.2f}s '
-                        '(total), {:.2f}s (since last iteration) ')
-        self.count = count
+class OutputLogger(object):
+    def __init__(self, dummy=False):
+        self.message = ('Cycle {}, Batch {}, Iteration {}: '
+                        'Cost: {:6.4f} | Time Elapsed: {:.2f}s (total), '
+                        '{:.2f}s (since last iteration) ')
+        self.count = 0
+        self.current_cost = 0
+        self.last_time = time.clock()
+        self.total_time = 0
+        self.cycle = 0
+        self.batch = 0
+        self.elapsed = 0
+        self.dummy = False
+
+    def reset_progress(self):
+        if self.dummy:
+            return
+
+        self.count = 0
         self.cost = 0
         self.last_time = time.clock()
         self.total_time = 0
 
-    def reset(self, count=0):
-        self.count = count
-        self.cost = 0
-        self.last_time = time.clock()
-        self.total_time = 0
-
-    def update(self, *args, **kwargs):
+    def update_progress(self, *args, **kwargs):
+        if self.dummy:
+            return
+        
         self.count += 1
         now = time.clock()
-        elapsed = now - self.last_time
-        self.total_time += elapsed
+        self.elapsed = now - self.last_time
+        self.total_time += self.elapsed
         self.last_time = now
-        message = '\r' + self.message.format(self.count, self.cost, self.total_time, elapsed)
+        self.redisplay_progress()
+
+    def update_cost(self, cost):
+        self.current_cost = cost
+
+    def redisplay_progress(self):
+        message = self.message.format(self.cycle, self.batch, 
+                                      self.count, self.current_cost, 
+                                      self.total_time, self.elapsed)
+        self._overwrite_last(message)
+
+    def display_progress(self):
+        message = self.message.format(self.batch, self.cycle, 
+                                      self.count, self.current_cost, 
+                                      self.total_time, self.elapsed)
+        print message
+
+    def update_cycle(self, cycle, batch):
+        self.cycle = cycle
+        self.batch = batch
+
+    def _overwrite_last(self, message):
+        message = '\r' + message
         sys.stdout.write(message)
         sys.stdout.flush()
 
-def markov_visualizer(network, start, key, sample=False, n_cycles=100):
+def get_next_selector(h, shift_ix=None, sample=True):
+    if shift_ix is not None:
+        cap = h[shift_ix] > 0.5
+        h[shift_ix] = 0
+    else:
+        cap = False
+
+    #h = h ** 2  # to weed out the less common letters
+    #h = h ** 1.5  # to weed out the less common letters
+    #h = h ** 1.3  # to weed out the less common letters
+    if sample:
+        selection = numpy.random.multinomial(1, h / h.sum())
+    else:
+        selection = h.argmax() == numpy.arange(h.shape[0])
+
+    if shift_ix is not None:
+        selection[shift_ix] = cap
+    
+    return selection
+
+# TODO: Replace this kludge with a proper plugin system that would allow
+# people to write their own markov visualizers or theta visualizers.
+
+# I need a well-defined interface for this though. That's difficult
+# because the visualizer needs to know a bunch of stuff that the
+# trainer / training cycle doesn't (and shouldn't) know anything
+# about. It needs to know what the values _mean_ in context, and 
+# that's already pretty complicated here in this one-off code. 
+
+# At this point, my plan is to have an improved `trainer` interface
+# that visualizer plugins can rely on.
+
+def markov_visualizer(network, n_cycles=100):
     n_features = network.theta_list[0].shape[1] - 1
     n_labels = network.theta_list[-1].shape[0]
 
+    # key is currently hard-coded... yuck
+    # key = ' ' + string.ascii_lowercase + string.ascii_uppercase
+    key = ''' !"'(),-.:;?_abcdefghijklmnopqrstuvwxyzX'''
+    shift_ix = -1
     inv_key = {c:n for n, c in enumerate(key)}
+    start = network.X[0:1,:]
     fakeY = numpy.asarray([[1]]) == numpy.arange(n_labels)
 
-    n = NetworkTrainer(network, start, fakeY)
+    n = network.clone(start, fakeY)
     for i in range(n_cycles):
-        r = n.get_result(sample).astype(float)
         s = start[0].reshape(-1, n_labels)
 
+        if shift_ix is not None:
+            caps = s[...,shift_ix]
+        else:
+            caps = [0] * s.shape[0]
+
         try:
-            print ''.join(key[char.nonzero()[0][0]] for char in s)
+            chars = (key[char.nonzero()[0][0]] for char in s)
+            print ''.join(c.upper() if cap else c for c, cap in zip(chars, caps))
+
         except IndexError:
             print "You've discovered the heisenbug. Please send the"
             print "following information to scott.enderle@gmail.com:"
             print (s.ravel() != 0).sum()
             print s.shape
+            print 
             break
+
+        r = get_next_selector(n.predict()[0], shift_ix)
         start[:,0:n_features - n_labels] = start[:,n_labels:]
         start[:,n_features - n_labels:] = r
         n.update_XY(start, fakeY)
 
+# TODO: _This_ should be implemented with one class for each type
+# of data input; this will be the easiest thing to re-write as a 
+# set of plugins. 
+
 class TrainingData(object):
-    def __init__(self, chunk_hint=40000):  
-                         # eventually make some educated guesses about which classmethod constructor to call
-                         # by checking if the input is a directory, h5 file, or pair of npy files
+    def __init__(self, h5_data, batch_size, chunk_bytes=5 * 10 ** 8):  
         self.generator = lambda: iter(())
-        self.data_filename = None
         self.in_size = None
         self.out_size = None
-        self.chunk_hint = chunk_hint
+        self.chunk_size = None
+        self.chunk_bytes = chunk_bytes
+        self.batch_size = batch_size
+        self.load_h5_table(h5_data)
 
     def __iter__(self):
         return self.generator()
 
-    @classmethod
-    def npy_dir(cls, training_dir):
-        instance = cls()
-        instance.load_npy_dir(training_dir)
-        return instance
-
-    @classmethod
-    def npy_single(cls, input_output):
-        instance = cls()
-        instance.load_npy_single(input_output)
-        return instance
-
-    @classmethod
-    def h5_table(cls, h5_file, chunk_hint=40000):
-        instance = cls(chunk_hint)
-        instance.load_h5_table(h5_file)
-        return instance
-    
-    def load_npy_dir(self, training_dir):
-        # Have this shuffle the data across all files. It will 
-        # require some refactoring.
-        
-        in_dir = os.path.join(training_dir, 'input')
-        out_dir = os.path.join(training_dir, 'output')
-        in_files  = [os.path.join(in_dir, f)  for f in os.listdir(in_dir)  
-                                              if f.endswith('.npy')]
-        out_files = [os.path.join(out_dir, f) for f in os.listdir(out_dir) 
-                                              if f.endswith('.npy')]
-        in_files.sort()
-        out_files.sort()
-        shuff = range(len(in_files))
-        random.shuffle(shuff)
-
-        in_files = [in_files[x] for x in shuff]
-        out_files = [out_files[x] for x in shuff]
-
-        self.in_size = numpy.load(in_files[0], mmap_mode='r').shape[1]
-        self.out_size = numpy.load(out_files[0], mmap_mode='r').shape[1]
-        self.generator = self._npy_gen(in_files, out_files)
-
-    def load_npy_single(self, input_output):
-        in_file, out_file = input_output
-
-        self.in_size = numpy.load(in_file, mmap_mode='r').shape[1]
-        self.out_size = numpy.load(out_file, mmap_mode='r').shape[1]
-        self.generator = self._npy_gen([in_file], [out_file])
-
-    def _npy_gen(self, in_seq, out_seq):
-        def data_iter():
-            data_zip = itertools.izip(in_seq, out_seq)
-            for in_f, out_f in data_zip:
-                in_arr = numpy.load(in_f).astype(float)
-                out_arr = numpy.load(out_f).astype(float)
-                yield in_arr, in_f, out_arr, out_f
-        return data_iter
-
-    def _h5_fast_bool_ix(self, h5_array, ix, read_chunksize=30000):
+    def _h5_fast_bool_ix(self, h5_array, ix):
         '''Iterate over an h5 array chunkwise to select a random subset
         of the array. `h5_array` should be the array itself; `ix` should
         be a boolean index array with as many values as `h5_array` has
         rows, and you can optionally set the number of rows to read per
-        chunk with `read_chunksize` (default is 10000). For some reason
+        chunk with `read_chunksize` (default is 30000). For some reason
         this is much faster than using `ix` to index the array directly.'''
 
-        n_chunks = h5_array.shape[0] / read_chunksize
+        # As time goes on, this solution looks worse and worse.
+        # I want to try using h5py instead. 
+
+        read_chunksize = self.chunk_size
+
+        n_rows = h5_array.shape[0]
+        n_chunks = n_rows / read_chunksize
+        if n_chunks * read_chunksize < n_rows:
+            n_chunks += 1
+        
         slices = [slice(i * read_chunksize, (i + 1) * read_chunksize)
                   for i in range(n_chunks)]
 
-        a = numpy.empty((ix.sum(), h5_array.shape[1]), dtype=float)
+        a = numpy.zeros((ix.sum(), h5_array.shape[1]), dtype=float)
         a_start = 0
         for sl in slices:
             chunk = h5_array[sl][ix[sl]]
             a_end = a_start + chunk.shape[0]
             a[a_start:a_end] = chunk
             a_start = a_end
+
+        fail = (a.sum(axis=1) == 0).nonzero()
+        if fail[0].size > 0:
+            print fail
 
         return a
 
@@ -518,68 +660,84 @@ class TrainingData(object):
     # b[inv_ix] = x
     # (a == b).all() is True
 
-    def _h5_fast_ix(self, h5_array, ix, read_chunksize=30000):
+    #def _h5_fast_ix(self, h5_array, ix, read_chunksize=30000):
 
-        n_chunks = h5_array.shape[0] / read_chunksize
-        slices = [slice(i * read_chunksize, (i + 1) * read_chunksize)
-                  for i in range(n_chunks)]
+    #    n_chunks = h5_array.shape[0] / read_chunksize
+    #    slices = [slice(i * read_chunksize, (i + 1) * read_chunksize)
+    #              for i in range(n_chunks)]
 
-        bool_ix = numpy.zeros(h5_array.shape[0], dtype=bool)  
-        bool_ix[ix] = 1                                      
-        order_ix = numpy.zeros(h5_array.shape[0], dtype=int)
-        order_ix[ix] = numpy.arange(ix.shape[0])
+    #    bool_ix = numpy.zeros(h5_array.shape[0], dtype=bool)  
+    #    bool_ix[ix] = 1                                      
+    #    order_ix = numpy.zeros(h5_array.shape[0], dtype=int)
+    #    order_ix[ix] = numpy.arange(ix.shape[0])
 
-        a = numpy.empty((ix.shape[0], h5_array.shape[1]), dtype=float)
-        for sl in slices:
-            h5_chunk = h5_array[sl]
-            bool_chunk = bool_ix[sl]
-            order_chunk = order_ix[sl]
-            a[order_chunk[bool_chunk]] = h5_chunk[bool_chunk]
+    #    a = numpy.empty((ix.shape[0], h5_array.shape[1]), dtype=float)
+    #    for sl in slices:
+    #        h5_chunk = h5_array[sl]
+    #        bool_chunk = bool_ix[sl]
+    #        order_chunk = order_ix[sl]
+    #        a[order_chunk[bool_chunk]] = h5_chunk[bool_chunk]
 
-        return a
+    #    return a
 
-    def _h5_gen(self, h5_file, chunksize):
+    def _h5_gen(self, h5_file):
         with closing(tables.open_file(h5_file, 'r')) as f:
             in_rows = f.root.input.shape[0]
-            
-        n_chunks = in_rows / chunksize
-        if n_chunks * chunksize < in_rows:
+        
+        chunk_size = self.chunk_size
+
+        n_chunks = in_rows / chunk_size
+        if n_chunks * chunk_size < in_rows:
             n_chunks += 1
 
         def data_iter():
             with closing(tables.open_file(h5_file, 'r')) as f:
                 h5_in = f.root.input
                 h5_out = f.root.output
-                
                 mask = numpy.arange(in_rows) % n_chunks
                 numpy.random.shuffle(mask)
-                
-                for i in range(n_chunks):
-                    bool_mask = mask == i
-
+               
+                ix_func = self._h5_fast_bool_ix
+                for chunk in xrange(n_chunks):
+                    bool_mask = mask == chunk
                     order = numpy.arange(bool_mask.sum())
                     numpy.random.shuffle(order)
-                    in_arr  = self._h5_fast_bool_ix(h5_in,  bool_mask)[order]
-                    out_arr = self._h5_fast_bool_ix(h5_out, bool_mask)[order]
-                
-                    in_name = '{}-input-chunk-{}'
-                    in_name = in_name.format(h5_file, i)
-                
-                    out_name = '{}-output-chunk-{}'
-                    out_name = out_name.format(h5_file, i)
-                
-                    yield in_arr, in_name, out_arr, out_name
+                    
+                    in_arr  = ix_func(h5_in,  bool_mask)[order]
+                    out_arr = ix_func(h5_out, bool_mask)[order]
+                   
+                    # nesting is too deep here. break this out.
+                    for batch in xrange(0, chunk_size, self.batch_size):
+                        batch_slice = slice(batch, batch + self.batch_size)
+                        name_params = (h5_file, chunk, batch / self.batch_size)
+                        in_name = '{} input chunk {}, batch {}'
+                        in_name = in_name.format(*name_params)
+                        out_name = '{} output chunk {}, batch {}'
+                        out_name = out_name.format(*name_params)
+                        output = (in_arr[batch_slice], in_name, 
+                                  out_arr[batch_slice], out_name)
+                        yield output
+        
         return data_iter
 
-    def load_h5_table(self, h5_file, chunksize=None):
-        if chunksize is None:
-            chunksize = self.chunk_hint
+    def load_h5_table(self, h5_file):
         with closing(tables.open_file(h5_file, 'r')) as f:
             self.in_size = f.root.input.shape[1]
             self.out_size = f.root.output.shape[1]
-        self.generator = self._h5_gen(h5_file, chunksize)
+        
+            # Loading from h5 tables is slow, so load in chunks, and then
+            # yield in smaller batches (if batch_size is smaller).
+            chunk_size = self.chunk_bytes / (self.in_size * 8)
+            
+            # Chunks should be congruent with batches
+            if chunk_size > self.batch_size:
+                self.chunk_size = chunk_size - chunk_size % self.batch_size
+            else:
+                self.chunk_size = self.batch_size
+        
+        self.generator = self._h5_gen(h5_file)
 
-    def shape_network(self, layers, gap_size=0):
+    def shape_weights(self, layers, gap_size=0):
         in_size = self.in_size
         out_size = self.out_size
 
@@ -605,37 +763,20 @@ class TrainingData(object):
     
         return shape
 
-def train_cv(X, Y):
-    n_points = X.shape[0]
- 
-    cv = n_points * 0.75
-    X_data = (X[:cv,:], 
-              X[cv:,:],)
-    Y_data = (Y[:cv,:],
-              Y[cv:,:],)
-    
-    return X_data, Y_data
+def training_loop():
+    pass
+    # TODO: Move training loop here?
 
 def build_parser():
     nn_parser = argparse.ArgumentParser(description='Feedforward Neural Network.')
-    input_group = nn_parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument('-I', '--training-input', 
-        type=str, nargs=2, metavar='file', help=('Paths to two '
-        'numpy-readable files containing input and output for training. '
-        'Mutually exclusive with the --training-directory and --training-h5 '
-        'options.'))
-    input_group.add_argument('-D', '--training-directory', type=str,
-        metavar='directory', help=('Path to a directory containing '
-        'training data. Input and output data should be stored in separate '
-        'directories `input` and `output`. The two folders should contain '
-        'only training data, and should have an equal number of files. '
-        'Inputs will be matched to outputs by sorting the filenames. '
-        'Mutually exclusive with the --training-input and --training-h5 '
-        'options.'))
-    input_group.add_argument('-5', '--training-h5', type=str, 
+    nn_parser.add_argument('-I', '--training-input', type=str, required=True,
         metavar='h5_file', help=('Path to an h5 file containing '
         'training data. Input and output data should be stored in arrays '
         '`root.input` and `root.output`.')) 
+    nn_parser.add_argument('-C', '--cv-input', type=str, metavar='h5_file',
+        help=('Path to an h5 file containing cross-validation data. Input '
+        'and output data should be stored in arrays `root.input` and '
+        '`root.output`.'))
 
     shape_group = nn_parser.add_mutually_exclusive_group(required=True)
     shape_group.add_argument('-L', '--num-layers', metavar='integer', 
@@ -648,21 +789,12 @@ def build_parser():
         'list of layer sizes, starting with the input layer. Mutually '
         'exclusive with the --num-layers option.'))
 
-    nn_parser.add_argument('-c', '--cv-split', action='store_true', 
-        default=False, help=('Set aside a quarter of the training '
-        'data for cross-validation (CV) purposes. Test data is assumed to '
-        'be held separately. Currently, when running multiple training '
-        'cycles, the entire input dataset will be randomly shuffled, mixing '
-        'training and CV data from the previous cycle. In that case, it is '
-        'best to set aside a separate CV dataset. (The CV output can still '
-        'be useful for monitoring fit within a single cycle.)'))
-    # TODO Here add separate CV and Test data inputs, mutually exclusive with '--cv-split'
-    
     # TODO There needs to be a way to store shape size alongside theta; 
     # it is clunky to require all these values to match. Once that's
     # implemented, this will be mutually exclusive with --num-layers. 
     # In the long run there should be separate training, testing, and
     # prediction commands.
+
     nn_parser.add_argument('-T', '--theta', metavar='file', 
         help=('Path to a numpy-readable file containing the weights '
         'of a trained network, represented as a flattened array. The shape '
@@ -673,14 +805,21 @@ def build_parser():
         'CAUTION: This currently does nothing to prevent you from '
         'overwriting a file, nor does it check that the save location '
         'exists.'))
-   
-    nn_parser.add_argument('-C', '--chunk-size', metavar='integer', type=int,
-        default=40000, help=('Number of samples to load per chunk '
-        'when training on large datasets stored in h5 files. (When loading '
-        'from pre-chunked data, this value is ignored.) Defaults to 40000.'))
-    nn_parser.add_argument('-r', '--regularization', metavar='float', 
-        default=1, type=float, help=('Regularization factor. '
-        'Defaults to 1.'))
+
+    optimizer_group = nn_parser.add_mutually_exclusive_group()
+    optimizer_group.add_argument('-g', '--stochastic-gradient-descent',
+        type=float, default=0.3, const=0.3, nargs='?', help=('Use a simple '
+        'stochastic gradient descent algorithm for training. This is the '
+        'default. Accepts an optional argument specifying the learning rate '
+        'alpha. If the argument is not present, or if no alternative '
+        'training algorithm is selected, then alpha defaults to 0.3.'))
+    optimizer_group.add_argument('-c', '--conjugate-gradient', 
+        action='store_true', help=('Use a conjugate gradient algorithm for '
+        'training.'))
+
+    nn_parser.add_argument('-b', '--batch-size', metavar='integer', type=int,
+        default=40000, help=('Number of samples to load per training batch. '
+        'Defaults to 40000.'))
     nn_parser.add_argument('-i', '--num-iterations', metavar='integer', 
         default=-1, type=int, help=('Number of training iterations. '
         'Defaults to 0, in which case a prediction task is assumed.'))
@@ -688,11 +827,17 @@ def build_parser():
         default=1, help=('Number of training cycles. If this option '
         'is selected, the trainer will cycle over the entire dataset '
         'multiple times; the total number of training iterations will then '
-        'be num_iterations x num_cycles. This is most useful for large '
-        'datasets that have to be processed in chunks.'))
+        'be num_iterations x num_cycles.'))
+    
+    nn_parser.add_argument('-o', '--vis-interval', 
+        metavar='integer', type=int, default=1, help=('Number of batches to '
+        'process before generating a visualization. Defaults to 1.'))
+    nn_parser.add_argument('-r', '--regularization', metavar='float', 
+        default=0, type=float, help=('Regularization factor. '
+        'Defaults to 0.'))
     nn_parser.add_argument('-v', '--visualizer', metavar='mode', type=str, 
-        choices=['markov', 'markov-rand'], help=('Chose '
-        'visualization mode. Only `markov` and `markov-rand` are currently '
+        choices=['markov'], help=('Choose '
+        'visualization mode. Only `markov` is currently '
         'impemented (for character prediction).'))
     nn_parser.add_argument('--check-gradient', metavar='integer', type=int, 
         default=False, help=('Run a diagnostic test on a random '
@@ -705,88 +850,103 @@ if __name__ == '__main__':
 
     args = build_parser().parse_args()
 
-    if args.training_input is not None:
-        training_data = TrainingData.npy_single(args.training_input)
-    elif args.training_directory is not None:
-        training_data = TrainingData.npy_dir(args.training_directory)
-    else:
-        training_data = TrainingData.h5_table(args.training_h5, args.chunk_size)
-
+    training_data = TrainingData(args.training_input, args.batch_size)
     if args.num_layers is not None:
-        shape = training_data.shape_network(args.num_layers, gap_size=0)
+        shape = training_data.shape_weights(args.num_layers, gap_size=0)
     else:
         shape = args.shape
     print "Network Shape:", tuple(shape)
     
-    nn = Network(shape)
+    logger = OutputLogger()
+    nn = Network(shape, logger=logger)
     if args.theta is not None:
-        nn.theta = numpy.load(args.theta)
-    
-    tr = NetworkTrainer(nn)
-    cv = NetworkTrainer(nn)
-    for cycle in range(args.num_cycles):
-        for i, (X, xname, Y, yname) in enumerate(training_data):
-            print ('Cycle {}, '
-                   'Training Input {}: \n\t'
-                   'X -- {}\n\t'
-                   'Y -- {}').format(cycle, i, xname, yname)
-            
-            print "Splitting Data..."
-            if args.cv_split:
-                (X_tr, X_cv), (Y_tr, Y_cv) = train_cv(X, Y)
-            else:
-                X_tr, Y_tr = X, Y
+        print "Loading Theta..."
+        nn.load_theta(args.theta)
 
-            tr.update_XY(X_tr, Y_tr)
+    # Currently, cross-validation output is desgined to help understand how
+    # each training batch affects the overall performance of the network. As
+    # such, this only uses a small portion of the CV data. A fuller CV test
+    # must be done after a lot of training to ensure that irregularities in
+    # the selected CV data haven't masked over or underfitting. That CV test
+    # can involve simply passing in the CV data as plain training data with
+    # the number of training iterations set to zero. A better solution for
+    # cross-validation needs to be implemented eventually, but this is OK for
+    # now. 
+
+    if args.cv_input:
+        print "Loading CV Data..."
+        cv_chunksize = int(float(args.batch_size) / 3) + 1
+        cv_data = TrainingData(args.cv_input, cv_chunksize)
+        X_cv, _, Y_cv, _ = iter(cv_data).next()
+        cv = nn.clone(X_cv, Y_cv)
+
+    print "Loading Initial Training Data..."
+    print
+    for cycle in range(args.num_cycles):
+        for batch, (X, xname, Y, yname) in enumerate(training_data):
+            logger.update_cycle(cycle, batch)
+            nn.update_XY(X, Y)
 
             if args.check_gradient:
                 msg = ('Calculated Gradient: {}; '
                        'Estimated Gradient: {}; '
                        'Error: {}')
                 print "Checking Gradient Calculation..."
-                grad_est_err = tr.check_gradient_sample(nn.theta, args.check_gradient)
+                grad_est_err = nn.check_gradient_sample(nn.theta, args.check_gradient)
                 for grad, est, err in grad_est_err:
                     print msg.format(grad, est, err)
 
             if args.num_iterations > 0:
-                print "Training..."
-                tr.train(args.regularization, args.num_iterations)
-            
-            a1, a3, a5 = tr.accuracy_topn(1, 3, 5)
-            print
-            print "Training accuracy:        ", a1
-            print "Training accuracy (top 3):", a3
-            print "Training accuracy (top 5):", a5
-            print "Training entropy:         ", tr.entropy()
+                if args.conjugate_gradient:
+                    nn.train_cg(args.num_iterations, args.regularization)
+                else:
+                    nn.train_sgd(args.num_iterations, 
+                                 args.regularization, 
+                                 args.stochastic_gradient_descent)
 
-            if args.cv_split:
-                cv.update_XY(X_cv, Y_cv)
-                a1, a3, a5 = cv.accuracy_topn(1, 3, 5)
-                print "CV accuracy:              ", a1
-                print "CV accuracy (top 3):      ", a3
-                print "CV accuracy (top 5):      ", a5
-                print "CV entropy:               ", cv.entropy()
+            if (batch + 1) % args.vis_interval == 0:
+                a1, a3, a5 = nn.accuracy_topn(1, 3, 5)
+                print
+                print
+                print "Training accuracy:        ", a1
+                print "Training accuracy (top 3):", a3
+                print "Training accuracy (top 5):", a5
+                print "Training entropy:         ", nn.entropy()
 
-                res = cv.get_result()
-                print
-                print "Some predicted results:", res[0:20,:].argmax(axis=1)
-                print "The actual results:    ", Y_cv[0:20,:].argmax(axis=1)
-                print
+                if args.cv_input:
+                    a1, a3, a5 = cv.accuracy_topn(1, 3, 5)
+                    print
+                    print "CV accuracy:              ", a1
+                    print "CV accuracy (top 3):      ", a3
+                    print "CV accuracy (top 5):      ", a5
+                    print "CV entropy:               ", cv.entropy()
 
-            if args.visualizer == 'markov':
-                markov_visualizer(nn, X_tr[0:1,:], list(' ' + string.lowercase))
-                print
-            elif args.visualizer == 'markov-rand':
-                markov_visualizer(nn, X_tr[0:1,:], list(' ' + string.lowercase), True)
-                print
+                    res = cv.predict()
+                    print
+                    print "Some predicted results:", res[0:20,:].argmax(axis=1)
+                    print "The actual results:    ", Y_cv[0:20,:].argmax(axis=1)
+
+                # TODO: Replace with vis plug-in interface here.   
+                #key = ' ' + string.ascii_lowercase 
+                
+                if args.visualizer == 'markov':
+                    print
+                    markov_visualizer(nn)
+                    print
 
         if args.save_theta is not None:
             tmpname = '.temp_' + args.save_theta
-            numpy.save(tmpname, nn.theta)
+            nn.save_theta(tmpname)
+
     if args.save_theta is not None:
         if not args.save_theta.endswith('.npy'):
             savename = args.save_theta + '.npy'
+        else:
+            savename = args.save_theta
+
         try:
             os.rename('.temp_' + savename, savename)
         except OSError:
-            numpy.save(savename, nn.theta)
+            nn.save_theta(savename)
+    else:
+        nn.save_theta('tmp_theta_' + '_'.join(nn.shape))
