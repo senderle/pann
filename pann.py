@@ -31,6 +31,8 @@ import argparse
 import os
 import itertools
 import random
+import collections
+from matplotlib import pyplot
 from textwrap import TextWrapper
 from contextlib import closing
 
@@ -225,7 +227,9 @@ class Network(object):
 
         for _ in xrange(iters):
             self._cost(theta)
-            theta -= alpha * self._gradient(theta)
+            grad = self._gradient(theta)
+            grad /= (grad * grad).sum() ** 0.5
+            theta -= alpha * grad
             self._callback()
         
         self.theta = theta
@@ -265,6 +269,7 @@ class Network(object):
         return results
 
     def entropy(self):
+        self._forward_propagation()
         h = self._avals[-1]
         probs = h[self.Y.nonzero()]
         return -(numpy.log2(probs)).sum() / self.Y.shape[0]
@@ -474,82 +479,161 @@ class _Weights(object):
         return theta
 
 class OutputLogger(object):
-    def __init__(self, dummy=False):
-        self.message = ('Cycle {}, Batch {}, Iteration {}: '
-                        'Cost: {:6.4f} | Time Elapsed: {:.2f}s (total), '
-                        '{:.2f}s (since last iteration) ')
-        self.count = 0
-        self.current_cost = 0
-        self.last_time = time.clock()
-        self.total_time = 0
-        self.cycle = 0
-        self.batch = 0
-        self.elapsed = 0
-        self.dummy = False
+    def __init__(self, message=None, dummy=False):
+        self.message = message
+        self.dummy = dummy
+        
+        self.custom = collections.defaultdict(str)
+        self.reset_progress()
 
     def reset_progress(self):
         if self.dummy:
             return
-
-        self.count = 0
+        self.iteration = 0
         self.cost = 0
+        self.elapsed_time = 0
         self.last_time = time.clock()
         self.total_time = 0
 
     def update_progress(self, *args, **kwargs):
         if self.dummy:
             return
-        
-        self.count += 1
+        self.iteration += 1
         now = time.clock()
-        self.elapsed = now - self.last_time
-        self.total_time += self.elapsed
+        self.elapsed_time = now - self.last_time
+        self.total_time += self.elapsed_time
         self.last_time = now
-        self.redisplay_progress()
+        self.display_progress()
 
     def update_cost(self, cost):
-        self.current_cost = cost
-
-    def redisplay_progress(self):
-        message = self.message.format(self.cycle, self.batch, 
-                                      self.count, self.current_cost, 
-                                      self.total_time, self.elapsed)
-        self._overwrite_last(message)
+        self.cost = cost
 
     def display_progress(self):
-        message = self.message.format(self.batch, self.cycle, 
-                                      self.count, self.current_cost, 
-                                      self.total_time, self.elapsed)
-        print message
+        message = self.message.format(std=self, **self.custom)
+        self._overwrite_last(message)
 
-    def update_cycle(self, cycle, batch):
-        self.cycle = cycle
-        self.batch = batch
+    def update_custom(self, **args):
+        self.custom.update(args)
 
     def _overwrite_last(self, message):
         message = '\r' + message
         sys.stdout.write(message)
         sys.stdout.flush()
 
-def get_next_selector(h, shift_ix=None, sample=True):
-    if shift_ix is not None:
-        cap = h[shift_ix] > 0.5
-        h[shift_ix] = 0
-    else:
-        cap = False
+class AdaptiveAlpha(object):
+    def __init__(self, cv_network, weight_decay, max_samples=None):
+        self.cv_network = cv_network
+        if max_samples is None:
+            self.max_samples = int(math.log(2 ** 16, weight_decay))
+            self.min_samples = int(math.log(5, weight_decay))
+        else:
+            self.max_samples = max_samples
+            self.min_samples = self.max_samples / 4
+        self.weight_decay = weight_decay
+        self.samples = collections.deque(maxlen=self.max_samples) 
+        
+        bins = numpy.exp(numpy.linspace(0.01, 4, 400)) - 1
+        self.bins = numpy.around(bins, 2)
 
-    #h = h ** 2  # to weed out the less common letters
-    #h = h ** 1.5  # to weed out the less common letters
-    #h = h ** 1.3  # to weed out the less common letters
-    if sample:
-        selection = numpy.random.multinomial(1, h / h.sum())
-    else:
-        selection = h.argmax() == numpy.arange(h.shape[0])
+    def sample(self, current_alpha, timestamp):
+        a_ix = numpy.searchsorted(self.bins, current_alpha)
+        alpha = self.bins[a_ix]
+        self.samples.append((alpha, self.cv_network.entropy(), timestamp))
 
-    if shift_ix is not None:
-        selection[shift_ix] = cap
-    
-    return selection
+    def sum_samples(self):
+        alpha_sums = {}
+        min_timestamp = min(t for _1, _2, t in self.samples)
+        for alpha, entropy, timestamp in self.samples:
+            weight = 1.0 / (self.weight_decay ** (timestamp - min_timestamp))
+
+            if alpha in alpha_sums:
+                a, w = alpha_sums[alpha]
+                alpha_sums[alpha] = (a + entropy * weight, w + weight)
+            else:
+                alpha_sums[alpha] = (entropy * weight, weight)
+
+        for a in alpha_sums:
+            e, w = alpha_sums[a]
+            alpha_sums[a] = (float(e) / w, w)
+        
+        return alpha_sums
+
+    def optimize_alpha(self, alpha, show_plot=False):
+        if len(self.samples) < self.min_samples:
+            return alpha
+        polyfit = numpy.polynomial.polynomial.polyfit 
+        polyval = numpy.polynomial.polynomial.polyval
+
+        alpha_sums = self.sum_samples()
+        alphas, sums_weights = zip(*alpha_sums.iteritems())
+        sums, weights = zip(*sums_weights)
+        alphas = numpy.asarray(alphas)
+        sums = numpy.asarray(sums)
+        weights = numpy.asarray(weights)
+
+        fit_params = polyfit(alphas, sums, 2, w=weights)
+        sum_fit = polyval(self.bins, fit_params)
+
+        alpha_ix = numpy.searchsorted(self.bins, alpha)
+        min_ix = sum_fit.argmin()
+        if sum_fit[min_ix] < sum_fit[alpha_ix]:
+            if min_ix < alpha_ix:
+                alpha_ix -= 1
+            elif min_ix > alpha_ix and fit_params[-1] > 0: # don't increase
+                alpha_ix += 1                              # except towards a
+                                                           # global minimum
+            alpha = self.bins[alpha_ix]
+            
+        if show_plot:
+            self.gen_plot(alphas, sums, weights, fit_params)
+
+        return alpha
+
+    def gen_plot(self, alphas, sums, weights, fit_params):
+        polyval = numpy.polynomial.polynomial.polyval
+        sort_ix = alphas.argsort()
+        alphas = alphas[sort_ix]
+        sums = sums[sort_ix]
+        err = sums - polyval(alphas, fit_params)
+        window_size = int(len(err) ** 0.5)
+        err_size = err.size
+
+        err_windows = self.rolling_window(err, window_size)
+        sigma_raw = numpy.std(err_windows, axis=1, ddof=1)
+        sigma = numpy.empty_like(err)
+        sigma[:] = sigma_raw.max()
+        sigma_raw_size = sigma_raw.size
+        pad = (sigma.size - sigma_raw_size) / 2
+        sigma[pad:pad + sigma_raw_size] = sigma_raw
+
+        x_fit = alphas
+        y_fit = polyval(x_fit, fit_params)
+        pyplot.scatter(alphas, sums, s=weights * 3, color='b', alpha=0.5)
+        pyplot.plot(x_fit, y_fit, 'k')
+        pyplot.fill_between(x_fit, y_fit - sigma, y_fit + sigma, 
+                            color='b', alpha=0.2)
+        pyplot.savefig('foo{}.svg'.format(str(hash(str(alphas + sums)))), fmt='svg')
+        pyplot.clf()
+
+    def rolling_window(self, array, size):
+        shape = array.shape[:-1] + (array.shape[-1] - size + 1, size)
+        strides = array.strides + (array.strides[-1],)
+        ast = numpy.lib.stride_tricks.as_strided
+        return ast(array, shape=shape, strides=strides)
+
+    def corr_coef(self, a, b):
+        a = numpy.asarray(a)
+        b = numpy.asarray(b)
+        a_mean = a.mean()
+        b_mean = b.mean()
+        a -= a_mean
+        b -= b_mean
+        n = a.size
+        a_std = (numpy.dot(a, a) / (n - 1)) ** 0.5
+        b_std = (numpy.dot(b, b) / (n - 1)) ** 0.5
+        return numpy.dot(a, b) / (a_std * b_std * (n - 1))
+
+
 
 # TODO: Replace this kludge with a proper plugin system that would allow
 # people to write their own markov visualizers or theta visualizers.
@@ -562,6 +646,27 @@ def get_next_selector(h, shift_ix=None, sample=True):
 
 # At this point, my plan is to have an improved `trainer` interface
 # that visualizer plugins can rely on.
+
+def get_next_selector(h, shift_ix=None, sample=True):
+    if shift_ix is not None:
+        cap = h[shift_ix] > 0.5
+        h[shift_ix] = 0
+    else:
+        cap = False
+
+    #h = h ** 2  # to weed out the less common letters
+    #h = h ** 1.5  # to weed out the less common letters
+    #h = h ** 1.3  # to weed out the less common letters
+    h = h ** 1.2  # to weed out the less common letters
+    if sample:
+        selection = numpy.random.multinomial(1, h / h.sum())
+    else:
+        selection = h.argmax() == numpy.arange(h.shape[0])
+
+    if shift_ix is not None:
+        selection[shift_ix] = cap
+    
+    return selection
 
 def markov_visualizer(network, n_cycles=100):
     n_features = network.theta_list[0].shape[1] - 1
@@ -585,8 +690,12 @@ def markov_visualizer(network, n_cycles=100):
             caps = [0] * s.shape[0]
 
         try:
-            chars = (key[char.nonzero()[0][0]] for char in s)
-            print ''.join(c.upper() if cap else c for c, cap in zip(chars, caps))
+            chars = []
+            for char in s:
+                nonzero_tuple = char.nonzero()
+                nonzero_c = nonzero_tuple[0]
+                c_ix = nonzero_c[0]
+                chars.append(key[c_ix])
 
         except IndexError:
             print "You've discovered the heisenbug. Please send the"
@@ -595,6 +704,10 @@ def markov_visualizer(network, n_cycles=100):
             print s.shape
             print 
             break
+        
+        #chars = (key[char.nonzero()[0][0]] for char in s)
+        
+        print ''.join(c.upper() if cap else c for c, cap in zip(chars, caps))
 
         r = get_next_selector(n.predict()[0], shift_ix)
         start[:,0:n_features - n_labels] = start[:,n_labels:]
@@ -820,6 +933,10 @@ def build_parser():
     nn_parser.add_argument('-b', '--batch-size', metavar='integer', type=int,
         default=40000, help=('Number of samples to load per training batch. '
         'Defaults to 40000.'))
+    nn_parser.add_argument('-B', '--cv-batch-size', metavar='integer',
+        type=int, default=10000, help=('Number of samples to load for '
+        'cross-validation. Defaults to 15000. Ignored if --cv-input '
+        'is not supplied.'))
     nn_parser.add_argument('-i', '--num-iterations', metavar='integer', 
         default=-1, type=int, help=('Number of training iterations. '
         'Defaults to 0, in which case a prediction task is assumed.'))
@@ -857,7 +974,10 @@ if __name__ == '__main__':
         shape = args.shape
     print "Network Shape:", tuple(shape)
     
-    logger = OutputLogger()
+    message = ('Cycle: {cycle}, Batch: {batch}, Iteration: {std.iteration} | '
+               'Cost: {std.cost:6.4f} | Alpha: {alpha:4.3f} | Elapsed: '
+               '{std.elapsed_time:4.2f}s, {std.total_time:4.2f}s (total)')
+    logger = OutputLogger(message=message)
     nn = Network(shape, logger=logger)
     if args.theta is not None:
         print "Loading Theta..."
@@ -875,16 +995,23 @@ if __name__ == '__main__':
 
     if args.cv_input:
         print "Loading CV Data..."
-        cv_chunksize = int(float(args.batch_size) / 3) + 1
-        cv_data = TrainingData(args.cv_input, cv_chunksize)
+        cv_batchsize = int(float(args.cv_batch_size) / 3) + 1
+        cv_data = TrainingData(args.cv_input, cv_batchsize)
         X_cv, _, Y_cv, _ = iter(cv_data).next()
         cv = nn.clone(X_cv, Y_cv)
+
+    # EXPERIMENTAL:
+    alpha_decay = 1.01
+    adaptive_alpha = AdaptiveAlpha(cv, alpha_decay)
+    alpha = args.stochastic_gradient_descent
+    alpha_ent = 0
+    stepsize = 2 ** (int(math.log(alpha, 2)) - 7)
 
     print "Loading Initial Training Data..."
     print
     for cycle in range(args.num_cycles):
         for batch, (X, xname, Y, yname) in enumerate(training_data):
-            logger.update_cycle(cycle, batch)
+            logger.update_custom(cycle=cycle, batch=batch, alpha=alpha)
             nn.update_XY(X, Y)
 
             if args.check_gradient:
@@ -900,9 +1027,27 @@ if __name__ == '__main__':
                 if args.conjugate_gradient:
                     nn.train_cg(args.num_iterations, args.regularization)
                 else:
+                    
+                    # EXPERIMENTAL:
+                   
+                    if batch % 10 == 0:
+                        #newalpha = abs(random.gauss(alpha, alpha / 4 + 0.1))
+                        newalpha = abs(random.gauss(alpha, alpha / 4 + 0.025))
+                    else:
+                        newalpha = abs(random.gauss(alpha, alpha / 32 + 0.025))
+                    logger.update_custom(alpha=newalpha)
+
                     nn.train_sgd(args.num_iterations, 
                                  args.regularization, 
-                                 args.stochastic_gradient_descent)
+                                 newalpha)
+                    
+                    if batch % 10 == 0:
+                        adaptive_alpha.sample(newalpha, batch)
+                        alpha = adaptive_alpha.optimize_alpha(alpha, batch % 250 == 0)
+
+                    #nn.train_sgd(args.num_iterations, 
+                    #             args.regularization, 
+                    #             args.stochastic_gradient_descent)
 
             if (batch + 1) % args.vis_interval == 0:
                 a1, a3, a5 = nn.accuracy_topn(1, 3, 5)
