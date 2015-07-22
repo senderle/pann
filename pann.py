@@ -520,6 +520,7 @@ class OutputLogger(object):
         sys.stdout.write(message)
         sys.stdout.flush()
 
+######## Not ready for use in master ########
 class AdaptiveAlpha(object):
     def __init__(self, cv_network, weight_decay, max_samples=None):
         self.cv_network = cv_network
@@ -1000,14 +1001,6 @@ if __name__ == '__main__':
         X_cv, _, Y_cv, _ = iter(cv_data).next()
         cv = nn.clone(X_cv, Y_cv)
 
-    # TEST AND DELETE FROM MASTER BRANCH
-    alpha_decay = 1.01
-    adaptive_alpha = AdaptiveAlpha(cv, alpha_decay)
-    alpha = args.stochastic_gradient_descent
-    alpha_ent = 0
-    stepsize = 2 ** (int(math.log(alpha, 2)) - 7)
-    # END TEST AND DELETE
-
     print "Loading Initial Training Data..."
     print
     for cycle in range(args.num_cycles):
@@ -1028,33 +1021,9 @@ if __name__ == '__main__':
                 if args.conjugate_gradient:
                     nn.train_cg(args.num_iterations, args.regularization)
                 else:
-                    
-                    # DELETE FROM MASTER AND TEST EXPERIMENTAL:
-                   
-                    if batch % 10 == 0:
-                        #newalpha = abs(random.gauss(alpha, alpha / 4 + 0.1))
-                        newalpha = abs(random.gauss(alpha, alpha / 4 + 0.025))
-                    else:
-                        newalpha = abs(random.gauss(alpha, alpha / 32 + 0.025))
-                    logger.update_custom(alpha=newalpha)
-
                     nn.train_sgd(args.num_iterations, 
                                  args.regularization, 
-                                 newalpha)
-                    
-                    if batch % 10 == 0:
-                        adaptive_alpha.sample(newalpha, batch)
-                        alpha = adaptive_alpha.optimize_alpha(alpha, batch % 250 == 0)
-
-                    # END DELETE AND TEST
-
-                    # RESTORE TO MASTER AND TEST
-
-                    #nn.train_sgd(args.num_iterations, 
-                    #             args.regularization, 
-                    #             args.stochastic_gradient_descent)
-
-                    # END RESTORE AND TEST
+                                 args.stochastic_gradient_descent)
 
             if (batch + 1) % args.vis_interval == 0:
                 a1, a3, a5 = nn.accuracy_topn(1, 3, 5)
