@@ -330,7 +330,7 @@ class Network(object):
         self._last_theta = theta
         
         thetas = self.theta_list
-        n_samples = self.n_samples
+        n_samples = self._n_samples
         
         self._forward_propagation()
 
@@ -385,7 +385,7 @@ class Network(object):
         dvals = self._dvals
         
         thetas = self.theta_list
-        n_samples = self.n_samples
+        n_samples = self._n_samples
 
         dvals[-1][:] = avals[-1]
         dvals[-1] -= self.Y
