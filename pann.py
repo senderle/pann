@@ -520,7 +520,6 @@ class OutputLogger(object):
         sys.stdout.write(message)
         sys.stdout.flush()
 
-######## Not ready for use in master ########
 class AdaptiveAlpha(object):
     def __init__(self, cv_network, weight_decay, max_samples=None):
         self.cv_network = cv_network
@@ -922,8 +921,7 @@ def build_parser():
 
     optimizer_group = nn_parser.add_mutually_exclusive_group()
     optimizer_group.add_argument('-g', '--stochastic-gradient-descent',
-        type=float, default=0.3, const=0.3, nargs='?', 
-        metavar='learning_rate', help=('Use a simple '
+        type=float, default=0.3, const=0.3, nargs='?', help=('Use a simple '
         'stochastic gradient descent algorithm for training. This is the '
         'default. Accepts an optional argument specifying the learning rate '
         'alpha. If the argument is not present, or if no alternative '
@@ -976,20 +974,9 @@ if __name__ == '__main__':
         shape = args.shape
     print "Network Shape:", tuple(shape)
     
-
-    # The logic here for logging is terrible. I need to refactor this 
-    # part of the code. 
-
-    if args.conjugate_gradient:
-        message = ('Cycle: {cycle}, Batch: {batch}, Iteration: {std.iteration} | '
-                   'Cost: {std.cost:6.4f} | Elapsed: '
-                   '{std.elapsed_time:4.2f}s, {std.total_time:4.2f}s (total)')
-    else:
-        message = ('Cycle: {cycle}, Batch: {batch}, Iteration: {std.iteration} | '
-                   'Cost: {std.cost:6.4f} | Alpha: {alpha:4.3f} | Elapsed: '
-                   '{std.elapsed_time:4.2f}s, {std.total_time:4.2f}s (total)')
-        alpha = args.stochastic_gradient_descent
-    
+    message = ('Cycle: {cycle}, Batch: {batch}, Iteration: {std.iteration} | '
+               'Cost: {std.cost:6.4f} | Alpha: {alpha:4.3f} | Elapsed: '
+               '{std.elapsed_time:4.2f}s, {std.total_time:4.2f}s (total)')
     logger = OutputLogger(message=message)
     nn = Network(shape, logger=logger)
     if args.theta is not None:
@@ -1006,13 +993,6 @@ if __name__ == '__main__':
     # cross-validation needs to be implemented eventually, but this is OK for
     # now. 
 
-    if args.num_iterations < 1:
-        print
-        print "Assuming a prediction task. If you want to train a new"
-        print "network, you'll need to set the `--num-iterations` option"
-        print "to a value greater than 0."
-        print
-
     if args.cv_input:
         print "Loading CV Data..."
         cv_batchsize = int(float(args.cv_batch_size) / 3) + 1
@@ -1020,14 +1000,18 @@ if __name__ == '__main__':
         X_cv, _, Y_cv, _ = iter(cv_data).next()
         cv = nn.clone(X_cv, Y_cv)
 
+    # EXPERIMENTAL:
+    alpha_decay = 1.01
+    adaptive_alpha = AdaptiveAlpha(cv, alpha_decay)
+    alpha = args.stochastic_gradient_descent
+    alpha_ent = 0
+    stepsize = 2 ** (int(math.log(alpha, 2)) - 7)
+
     print "Loading Initial Training Data..."
     print
     for cycle in range(args.num_cycles):
         for batch, (X, xname, Y, yname) in enumerate(training_data):
-            if args.conjugate_gradient:
-                logger.update_custom(cycle=cycle, batch=batch)
-            else:
-                logger.update_custom(cycle=cycle, batch=batch, alpha=alpha)
+            logger.update_custom(cycle=cycle, batch=batch, alpha=alpha)
             nn.update_XY(X, Y)
 
             if args.check_gradient:
@@ -1043,9 +1027,27 @@ if __name__ == '__main__':
                 if args.conjugate_gradient:
                     nn.train_cg(args.num_iterations, args.regularization)
                 else:
+                    
+                    # EXPERIMENTAL:
+                   
+                    if batch % 10 == 0:
+                        #newalpha = abs(random.gauss(alpha, alpha / 4 + 0.1))
+                        newalpha = abs(random.gauss(alpha, alpha / 4 + 0.025))
+                    else:
+                        newalpha = abs(random.gauss(alpha, alpha / 32 + 0.025))
+                    logger.update_custom(alpha=newalpha)
+
                     nn.train_sgd(args.num_iterations, 
                                  args.regularization, 
-                                 args.stochastic_gradient_descent)
+                                 newalpha)
+                    
+                    if batch % 10 == 0:
+                        adaptive_alpha.sample(newalpha, batch)
+                        alpha = adaptive_alpha.optimize_alpha(alpha, batch % 250 == 0)
+
+                    #nn.train_sgd(args.num_iterations, 
+                    #             args.regularization, 
+                    #             args.stochastic_gradient_descent)
 
             if (batch + 1) % args.vis_interval == 0:
                 a1, a3, a5 = nn.accuracy_topn(1, 3, 5)
