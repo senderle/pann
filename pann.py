@@ -821,7 +821,7 @@ class TrainingData(object):
                     out_arr = ix_func(h5_out, bool_mask)[order]
                    
                     # nesting is too deep here. break this out.
-                    for batch in xrange(0, chunk_size, self.batch_size):
+                    for batch in xrange(0, in_arr.shape[0], self.batch_size):
                         batch_slice = slice(batch, batch + self.batch_size)
                         name_params = (h5_file, chunk, batch / self.batch_size)
                         in_name = '{} input chunk {}, batch {}'
@@ -830,7 +830,10 @@ class TrainingData(object):
                         out_name = out_name.format(*name_params)
                         output = (in_arr[batch_slice], in_name, 
                                   out_arr[batch_slice], out_name)
-                        yield output
+                        if batch < len(in_arr):
+                            yield output
+                        else:
+                            print "This should never happen."
         
         return data_iter
 
