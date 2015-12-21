@@ -5,7 +5,6 @@
 #
 #    Copyright 2014   by Jonathan Scott Enderle
 #
-5
 
 import numpy
 import tables
