@@ -1,6 +1,12 @@
 pann
 ====
 
+I am sad to say that this project has been more-or-less obsoleted by 
+[Keras](keras.io). If, that is, it was ever non-obsolete to begin
+with. But I hope that people will still find it useful for study or
+play.
+_______________________________________________________________
+
 A simple feed forward neural network trainer. 
 
 My goal is to create an application for training feed forward networks on 
