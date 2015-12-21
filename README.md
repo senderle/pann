@@ -2,7 +2,7 @@ pann
 ====
 
 I am sad to say that this project has been more-or-less obsoleted by 
-[Keras](keras.io). If, that is, it was ever non-obsolete to begin
+[Keras](http://keras.io). If, that is, it was ever non-obsolete to begin
 with. But I hope that people will still find it useful for study or
 play.
 _______________________________________________________________
