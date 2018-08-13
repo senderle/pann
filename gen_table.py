@@ -8,7 +8,7 @@ import numpy
 def gen_ft_parser():
     ft_parser = argparse.ArgumentParser(
         description='Generate a Character-Feature Translation Table')
-    ft_parser.add_argument('alphabet_file', metavar='alphabet_file', 
+    ft_parser.add_argument('alphabet_file', metavar='alphabet_file',
         type=str, help='A file contianing all the characters that will '
         'appear in the translation table.')
     ft_parser.add_argument('save_file', metavar='save_path',
@@ -33,7 +33,7 @@ def gen_row(c, key):
 
 def build_table(alphabet):
     code = ''.join(sorted(set(''.join(alphabet).lower())))
-    key = {c:i for i, c in enumerate(code)}
+    key = {c: i for i, c in enumerate(code)}
     table = numpy.zeros((len(alphabet), len(key) + 1))
     for i, c in enumerate(alphabet):
         table[i] = gen_row(c, key)
@@ -45,4 +45,3 @@ def main(args):
 
 if __name__ == "__main__":
     main(gen_ft_parser().parse_args())
-
